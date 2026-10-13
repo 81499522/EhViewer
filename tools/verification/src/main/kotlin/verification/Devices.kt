@@ -33,9 +33,18 @@ fun deviceTests(sdk: Path, serial: String, output: Path, app: Path, test: Path, 
     runCatching { run(ADB_LOG_NAME, "logcat", "-c") }
     val result = run("instrumentation.log", "shell", "am", "instrument", "-w", "-r", "moe.tarsin.ehviewer.debug.test/androidx.test.runner.AndroidJUnitRunner")
     run("native-errors.log", "logcat", "-d", "-s", "AndroidRuntime:E", "libc:F", "DEBUG:F")
-    require(Regex("(?m)^OK \\(19 tests\\)").containsMatchIn(result) && listOf("FAILURES!!!", "INSTRUMENTATION_FAILED", "Process crashed").none(result::contains)) { "JUnit did not report 19 successful tests" }
-    return mapOf("serial" to serial, "api" to api, "page_size" to pages, "tests" to 19, "apks" to digests, "result" to "PASS")
+    val tests = instrumentationTestCount(result)
+    return mapOf("serial" to serial, "api" to api, "page_size" to pages, "tests" to tests, "apks" to digests, "result" to "PASS")
         .also { output.resolve("result.json").writeText(json(it)) }
+}
+
+fun instrumentationTestCount(result: String): Int {
+    val summary = Regex("(?m)^OK \\((\\d+) tests?\\)\\r?$").findAll(result).toList().singleOrNull()
+    val count = summary?.groupValues?.get(1)?.toIntOrNull()
+    require(count != null && count > 0 && listOf("FAILURES!!!", "INSTRUMENTATION_FAILED", "Process crashed").none(result::contains)) {
+        "JUnit did not report a complete successful instrumentation run"
+    }
+    return count
 }
 
 private const val ADB_LOG_NAME = "logcat-clear.log"

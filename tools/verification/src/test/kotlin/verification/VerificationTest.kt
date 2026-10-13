@@ -12,6 +12,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VerificationTest {
+    @Test fun instrumentationCountsFollowRunnerDiscovery() {
+        assertEquals(20, instrumentationTestCount("Time: 1.2\nOK (20 tests)\n"))
+        assertEquals(1, instrumentationTestCount("OK (1 test)\r\n"))
+        assertEquals(25, instrumentationTestCount("OK (25 tests)\nINSTRUMENTATION_CODE: -1\n"))
+        listOf("OK (0 tests)\n", "OK (20 tests)\nFAILURES!!!", "Process crashed", "INSTRUMENTATION_FAILED", "OK (20 tests)\nOK (20 tests)\n").forEach { text ->
+            rejects { instrumentationTestCount(text) }
+        }
+    }
+
     private fun sample(abi: String = "arm64-v8a", align: Long = 16384, offset: Long = 0, count: Int = 1): ByteArray {
         val buffer = ByteBuffer.allocate(128).order(ByteOrder.LITTLE_ENDIAN)
         buffer.put(byteArrayOf(0x7f, 69, 76, 70, if (abi == "armeabi-v7a") 1 else 2, 1))

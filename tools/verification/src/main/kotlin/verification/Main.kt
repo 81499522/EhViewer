@@ -20,6 +20,8 @@ fun main(args: Array<String>) {
         "encrypt-diagnostics" -> encryptDiagnostics(options.path("--private-dir"), options.path("--public-key"), options.path("--output"))
         "decrypt-diagnostics" -> decryptDiagnostics(options.path("--input"), options.path("--private-key"), options.path("--output"))
         "device" -> deviceTests(tools().sdk, options.get("--serial"), options.path("--output"), options.path("--app", "app/build/outputs/apk/debug/app-universal-debug.apk"), options.path("--test-apk", "app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"))
+        "native-benchmark-inputs" -> com.hippo.ehviewer.jni.benchmarkArchives(options.path("--output"))
+        "native-benchmark" -> com.hippo.ehviewer.jni.nativeArchiveBenchmark(options)
         else -> error("Unknown command: ${args[0]}")
     }
     println(json(result))

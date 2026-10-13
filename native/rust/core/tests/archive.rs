@@ -61,6 +61,55 @@ fn buffers_outlive_session_and_are_independent() {
         assert_eq!(a.as_mut_slice(), b"xne");
     }
 }
+
+#[test]
+fn recycled_buffers_never_publish_previous_mutations() {
+    for name in ["stored.zip", "deflated.zip", "password.zip"] {
+        let session = open(name, true);
+        if session.needs_password() {
+            assert!(session.provide_password("baseline").unwrap());
+        }
+        for index in (0..3).cycle().take(100) {
+            let expected = [b"one".as_slice(), b"two", b"ten"][index];
+            let mut buffer = session.extract(index).unwrap();
+            assert_eq!(buffer.as_mut_slice(), expected);
+            buffer.as_mut_slice().fill(0xff);
+            drop(buffer);
+            assert_eq!(session.extract(index).unwrap().as_mut_slice(), expected);
+        }
+    }
+}
+
+#[test]
+fn large_stored_mappings_survive_close_and_unlink() {
+    let directory =
+        std::env::temp_dir().join(format!("ehviewer-large-stored-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let payload = directory.join("input");
+    File::create(&payload).unwrap().set_len(17 << 20).unwrap();
+    let archive = directory.join("large.zip");
+    let output = File::create(&archive).unwrap();
+    write_zip(
+        &mut [(File::open(&payload).unwrap(), "large.jpg".into())],
+        output.as_raw_fd(),
+    )
+    .unwrap();
+    drop(output);
+    let file = File::open(&archive).unwrap();
+    let size = file.metadata().unwrap().len();
+    let session = unsafe { ArchiveSession::open(file, size, true, Limits::default()) }.unwrap();
+    let mut first = session.extract(0).unwrap();
+    let mut other = session.extract(0).unwrap();
+    first.as_mut_slice()[0] = 123;
+    drop(session);
+    fs::remove_file(&archive).unwrap();
+    assert_eq!(first.as_mut_slice()[0], 123);
+    assert_eq!(other.as_mut_slice()[0], 0);
+    assert_eq!(other.as_mut_slice().len(), 17 << 20);
+    drop(first);
+    drop(other);
+    fs::remove_dir_all(directory).unwrap();
+}
 #[test]
 fn independent_and_shared_sessions_parallel() {
     let shared = Arc::new(open("deflated.zip", true));
@@ -78,6 +127,37 @@ fn independent_and_shared_sessions_parallel() {
             });
         }
     });
+}
+
+#[test]
+fn stored_streaming_transfers_obey_concurrency_limit() {
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct SlowWriter(Arc<AtomicUsize>, Arc<AtomicUsize>);
+    impl Write for SlowWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            let active = self.0.fetch_add(1, Ordering::SeqCst) + 1;
+            self.1.fetch_max(active, Ordering::SeqCst);
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            self.0.fetch_sub(1, Ordering::SeqCst);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let session = open("stored.zip", true);
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    std::thread::scope(|scope| {
+        for index in 0..12 {
+            let writer = SlowWriter(active.clone(), peak.clone());
+            let session = &session;
+            scope.spawn(move || session.extract_to(index % 3, writer).unwrap());
+        }
+    });
+    assert!(peak.load(Ordering::SeqCst) <= 4);
+    assert_eq!(active.load(Ordering::SeqCst), 0);
 }
 #[test]
 fn limits_malformed_and_paths() {

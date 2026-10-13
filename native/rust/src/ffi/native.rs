@@ -1,5 +1,6 @@
 #![cfg(feature = "jvm")]
 //! Stable Kotlin JNI surface. Sessions and algorithms live in ehviewer_core.
+mod registry;
 use super::jvm::{ThrowingHasDefault, jni_throwing};
 use anyhow::{Result, anyhow, ensure};
 use ehviewer_core::{
@@ -14,17 +15,18 @@ use jni::{
 };
 use jni_fn::jni_fn;
 use memmap2::MmapOptions;
+use registry::Registry;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 
 static SESSION: Mutex<Option<Arc<ArchiveSession>>> = Mutex::new(None);
 struct Buffer {
     object: GlobalRef,
-    data: PageBuffer,
+    data: Arc<Mutex<PageBuffer>>,
     archive: bool,
 }
-static BUFFERS: Mutex<Vec<Buffer>> = Mutex::new(Vec::new());
 const BUFFER_BUDGET: usize = 512 << 20;
+static BUFFERS: Mutex<Registry<Buffer>> = Mutex::new(Registry::new(128, BUFFER_BUDGET));
 fn session() -> Result<Arc<ArchiveSession>> {
     SESSION
         .lock()
@@ -40,43 +42,35 @@ fn sentinel<R: ThrowingHasDefault>(f: impl FnOnce() -> Result<R>) -> R {
     }
 }
 fn publish(env: &mut JNIEnv, mut data: PageBuffer, archive: bool) -> Result<jobject> {
-    let mut buffers = BUFFERS
-        .lock()
-        .map_err(|_| anyhow!("Buffer lock poisoned"))?;
-    let used: usize = buffers
-        .iter_mut()
-        .map(|b| b.data.as_mut_slice().len())
-        .sum();
+    let retained_bytes = data.retained_bytes();
     let bytes = data.as_mut_slice();
-    ensure!(
-        buffers.len() < 128 && bytes.len() <= BUFFER_BUDGET.saturating_sub(used),
-        "Native buffer budget exceeded"
-    );
+    let (address, len) = (bytes.as_mut_ptr(), bytes.len());
     // SAFETY: allocation/map has stable address and is retained until explicit release of this
     // exact Java object. It is independent of SESSION and protected against duplicate releases.
-    let object = unsafe { env.new_direct_byte_buffer(bytes.as_mut_ptr(), bytes.len())? };
+    let object = unsafe { env.new_direct_byte_buffer(address, len)? };
     let global = env.new_global_ref(&object)?;
-    buffers.push(Buffer {
+    let buffer = Buffer {
         object: global,
-        data,
+        data: Arc::new(Mutex::new(data)),
         archive,
-    });
+    };
+    // JNI allocation and global-reference creation do not hold the registry lock.
+    BUFFERS
+        .lock()
+        .map_err(|_| anyhow!("Buffer lock poisoned"))?
+        .insert(address as usize, len, retained_bytes, buffer)?;
     Ok(object.into_raw())
 }
 fn release(env: &JNIEnv, buffer: &JByteBuffer, archive: bool) -> Result<()> {
-    let mut buffers = BUFFERS
+    let address = env.get_direct_buffer_address(buffer)? as usize;
+    let removed = BUFFERS
         .lock()
-        .map_err(|_| anyhow!("Buffer lock poisoned"))?;
-    let mut found = None;
-    for (i, b) in buffers.iter().enumerate() {
-        if b.archive == archive && env.is_same_object(buffer, b.object.as_obj())? {
-            found = Some(i);
-            break;
-        }
-    }
-    if let Some(i) = found {
-        buffers.swap_remove(i);
-    }
+        .map_err(|_| anyhow!("Buffer lock poisoned"))?
+        .remove(address, |b| {
+            Ok(b.archive == archive && env.is_same_object(buffer, b.object.as_obj())?)
+        })?;
+    // Dropping a global reference or returning storage to its pool can run outside the registry.
+    drop(removed);
     Ok(())
 }
 #[jni_fn("com.hippo.ehviewer.jni.HashKt")]
@@ -102,18 +96,25 @@ pub fn rewriteGifSource(mut env: JNIEnv, _: JClass, buffer: JByteBuffer) {
             !env.call_method(&buffer, "isReadOnly", "()Z", &[])?.z()?,
             "Read-only GIF buffer"
         );
-        // Prevent concurrent native release while operating on a registered mapping.
-        let _buffers = BUFFERS
-            .lock()
-            .map_err(|_| anyhow!("Buffer lock poisoned"))?;
         let ptr = env.get_direct_buffer_address(&buffer)?;
         let cap = env.get_direct_buffer_capacity(&buffer)?;
         ensure!(
             cap <= isize::MAX as usize && !ptr.is_null(),
             "Invalid direct buffer"
         );
+        // Retain the containing allocation, including sliced views, then serialize writes to this
+        // allocation only. A concurrent release cannot free it or return its storage to the pool.
+        let registered = BUFFERS
+            .lock()
+            .map_err(|_| anyhow!("Buffer lock poisoned"))?
+            .covering(ptr as usize, cap)
+            .map(|b| b.data.clone());
+        let _lease = registered
+            .as_ref()
+            .map(|data| data.lock().map_err(|_| anyhow!("Buffer lock poisoned")))
+            .transpose()?;
         // SAFETY: Java owns this writable direct buffer for the duration of the call and must not
-        // mutate it concurrently; registry lock keeps app-owned allocations alive.
+        // mutate it concurrently; the retained lease keeps app-owned allocations alive.
         gif::rewrite(unsafe { std::slice::from_raw_parts_mut(ptr, cap) });
         Ok(())
     })
