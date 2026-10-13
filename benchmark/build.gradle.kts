@@ -29,8 +29,6 @@ android {
 }
 
 kotlin {
-    val javaVersion = libs.versions.java.get().toInt()
-    jvmToolchain(javaVersion)
     compilerOptions {
         jvmTarget = JvmTarget.fromTarget(libs.versions.android.jvm.get())
     }

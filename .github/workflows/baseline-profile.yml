@@ -60,12 +60,24 @@ jobs:
           cache-read-only: true
 
       - name: Generate Baseline Profile
-        run: ./gradlew generateBaselineProfile
-          -Pandroid.testoptions.manageddevices.emulator.gpu="swiftshader_indirect"
+        run: >-
+          ./gradlew :app:generateBaselineProfile -PreleaseAbi=x86_64
+          -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
+          --console=plain --stacktrace
+
+      - name: Upload generated profiles
+        uses: actions/upload-artifact@v7
+        with:
+          name: baseline-profiles
+          path: app/src/main/generated/baselineProfiles
+          if-no-files-found: error
 
       - name: Upload reports
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: reports
-          path: benchmark/build/reports
+          path: |
+            benchmark/build/reports
+            benchmark/build/outputs/managed_device_android_test_additional_output
+            app/build/reports

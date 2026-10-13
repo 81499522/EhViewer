@@ -2,6 +2,9 @@ cmake_minimum_required(VERSION 3.14)
 project(ehviewer C)
 include(ExternalProject)
 include(FetchContent)
+if (POLICY CMP0135)
+    cmake_policy(SET CMP0135 NEW)
+endif ()
 
 if (NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
     string(CONCAT CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O3 -ffast-math -fvisibility=hidden -fvisibility-inlines-hidden -funroll-loops -flto "
@@ -46,7 +49,7 @@ if (CMAKE_HOST_SYSTEM_NAME STREQUAL "Windows")
 else ()
     set(TOOLCHAIN "${ANDROID_TOOLCHAIN_ROOT}/bin")
 endif ()
-set(CONFIGURE_COMMAND ${WSL} ./.bootstrap && ${WSL} ./configure --disable-public-key --disable-dependency-tracking
+set(CONFIGURE_COMMAND ${WSL} ./configure --disable-public-key --disable-dependency-tracking
         "--host=${CMAKE_C_COMPILER_TARGET}"
         "CFLAGS=${CMAKE_C_FLAGS} -Qunused-arguments"
         "AR=${TOOLCHAIN}/llvm-ar"
@@ -55,9 +58,13 @@ set(CONFIGURE_COMMAND ${WSL} ./.bootstrap && ${WSL} ./configure --disable-public
 )
 ExternalProject_Add(
         nettle
-        GIT_REPOSITORY https://gitlab.com/gnutls/nettle.git
-        GIT_TAG bf13ee9e5024014cfa6d2fc097923afe087e63ba # nettle_4.0_release_20260205
-        GIT_CONFIG core.autocrlf=input
+        # Official release for bf13ee9e5024014cfa6d2fc097923afe087e63ba.
+        # CMake falls back between upstream hosts and checks the same immutable bytes.
+        URL https://ftp.gnu.org/gnu/nettle/nettle-4.0.tar.gz
+            https://www.lysator.liu.se/~nisse/archive/nettle-4.0.tar.gz
+        URL_HASH SHA256=3addbc00da01846b232fb3bc453538ea5468da43033f21bb345cb1e9073f5094
+        TIMEOUT 120
+        INACTIVITY_TIMEOUT 30
         CONFIGURE_COMMAND ${CONFIGURE_COMMAND}
         BUILD_COMMAND ${WSL} make -j4 libnettle.a
         INSTALL_COMMAND ""
