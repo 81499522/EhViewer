@@ -28,7 +28,7 @@ first publication, draft retries, lightweight/annotated tags, creation races and
 API failures, and never contact GitHub or publish assets.
 
 ```sh
-tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.7 \
+tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.8 \
   --sdk "$ANDROID_HOME" --output release-dry-run/apks --private-dir "$PWD/.private-release" --retention-days 180
 tools/verification/build/install/verification/bin/verification device --serial emulator-5560 \
   --sdk "$ANDROID_HOME" --output reports/api26
