@@ -121,6 +121,11 @@ for a separate diagnostic run (and implies `--samples`). It requires supported,
 enabled JVM thread CPU timing. Combine it with JDK safepoint logging when
 investigating wall-clock outliers. Do not mix instrumented CPU trials into the
 original latency comparison.
+The page-touch loop and timed extract/touch/release method are separate from
+optional statistics, so adding diagnostic output does not enlarge their JIT
+compilation bodies. Capture GC counters before allocating output sample lists.
+Historical measurements still require caution: a fixed 50-operation warmup is
+not proof that JIT compilation, CPU scheduling or the machine has stabilized.
 
 Repeat independent JVM trials for both ZIP inputs, alternating library order.
 `--retained N` measures extraction with other page buffers still outstanding.
