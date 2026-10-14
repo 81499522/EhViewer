@@ -28,7 +28,7 @@ first publication, draft retries, lightweight/annotated tags, creation races and
 API failures, and never contact GitHub or publish assets.
 
 ```sh
-tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.6 \
+tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.7 \
   --sdk "$ANDROID_HOME" --output release-dry-run/apks --private-dir "$PWD/.private-release" --retention-days 180
 tools/verification/build/install/verification/bin/verification device --serial emulator-5560 \
   --sdk "$ANDROID_HOME" --output reports/api26
@@ -90,9 +90,26 @@ owner-only private key offline and download encrypted artifacts before expiry.
 The decrypt command authenticates the complete envelope before retaining a
 0600 plaintext archive in an owner-only directory.
 
-`device` runs all 19 instrumentation tests on an already booted dedicated
+`device` runs all discovered instrumentation tests on an already booted dedicated
 local device and captures its API, page size, APK digests and logs. The removed
 CI emulator matrix and its AVD provisioning code are no longer maintained here.
+
+The host JNI performance workload is reproducible with JDK 25 and the same
+client for original C and Rust libraries. Fixtures are generated locally:
+
+```sh
+tools/verification/build/install/verification/bin/verification native-benchmark-inputs --output /private/tmp/ehviewer-benchmark
+JAVA_OPTS='--enable-native-access=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED' \
+  tools/verification/build/install/verification/bin/verification native-benchmark \
+  --library /absolute/path/to/libehviewer_rust.dylib --archive /private/tmp/ehviewer-benchmark/large-stored.zip \
+  --warmup 50 --loops 300
+```
+
+Repeat independent JVM trials for both ZIP inputs, alternating library order.
+`--retained N` measures extraction with other page buffers still outstanding.
+The workload touches each 4-KiB page and releases it; it does not measure Android
+rendering, real-device latency or long-session memory. Keep libraries, generated
+inputs and raw results outside Git.
 
 Regression archives, expected data and licenses are restored into the ignored
 `.local-test-fixtures/` directory from immutable Git baseline

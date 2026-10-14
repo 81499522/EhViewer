@@ -199,6 +199,48 @@ class NativeRegressionTest {
     }
 
     @Test
+    fun recycledBuffersAndSlicedGifViewsRemainIndependent() {
+        val file = java.io.File(instrumentation.targetContext.cacheDir, "native-reuse.zip")
+        val bytes = "xxGIF89a".toByteArray() + byteArrayOf(0, 0x21, 0xf9.toByte(), 4, 0, 1, 0, 0, 0)
+        java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+            val entry = java.util.zip.ZipEntry("page.gif").apply {
+                method = java.util.zip.ZipEntry.STORED
+                size = bytes.size.toLong()
+                compressedSize = size
+                crc = java.util.zip.CRC32().apply { update(bytes) }.value
+            }
+            zip.putNextEntry(entry)
+            zip.write(bytes)
+            zip.closeEntry()
+        }
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                assertEquals(1, openArchive(fd.fd, file.length(), true))
+                repeat(100) {
+                    val first = requireNotNull(extractToByteBuffer(0))
+                    val other = requireNotNull(extractToByteBuffer(0))
+                    val view = first.duplicate().apply { position(2) }.slice()
+                    releaseByteBuffer(first.duplicate()) // Only the original object releases its lease.
+                    rewriteGifSource(view)
+                    assertEquals(10.toByte(), first.get(13))
+                    assertEquals(1.toByte(), other.get(13))
+                    first.put(0, 99)
+                    releaseByteBuffer(first)
+                    val reused = requireNotNull(extractToByteBuffer(0))
+                    releaseByteBuffer(first) // A reused native address must not release a newer object.
+                    assertEquals('x'.code.toByte(), reused.get(0))
+                    assertEquals(1.toByte(), reused.get(13))
+                    releaseByteBuffer(reused)
+                    releaseByteBuffer(other)
+                }
+            }
+        } finally {
+            closeArchive()
+            file.delete()
+        }
+    }
+
+    @Test
     fun concurrentReadsAndRepeatedLifetimeDoNotLeakDescriptors() {
         val file = fixture("deflated.zip")
         val before = File("/proc/self/fd").list()?.size ?: 0
