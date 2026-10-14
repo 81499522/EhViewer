@@ -31,7 +31,8 @@ fn session() -> Result<Arc<ArchiveSession>> {
     SESSION
         .lock()
         .map_err(|_| anyhow!("Session lock poisoned"))?
-        .clone()
+        .as_ref()
+        .map(Arc::clone)
         .ok_or_else(|| anyhow!("No open archive"))
 }
 // Preserve C's sentinel results for recoverable archive errors. No password/error content is logged.
@@ -108,7 +109,7 @@ pub fn rewriteGifSource(mut env: JNIEnv, _: JClass, buffer: JByteBuffer) {
             .lock()
             .map_err(|_| anyhow!("Buffer lock poisoned"))?
             .covering(ptr as usize, cap)
-            .map(|b| b.data.clone());
+            .map(|b| Arc::clone(&b.data));
         let _lease = registered
             .as_ref()
             .map(|data| data.lock().map_err(|_| anyhow!("Buffer lock poisoned")))

@@ -241,6 +241,47 @@ class NativeRegressionTest {
     }
 
     @Test
+    fun privateStoredViewsDiscardWritesAndSurviveClose() {
+        val file = File(context.cacheDir, "native-stored-views.zip")
+        val bytes = ByteArray(5 shl 20) { (it % 251).toByte() }
+        java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+            zip.putNextEntry(
+                java.util.zip.ZipEntry("page.jpg").apply {
+                    method = java.util.zip.ZipEntry.STORED
+                    size = bytes.size.toLong()
+                    compressedSize = size
+                    crc = java.util.zip.CRC32().apply { update(bytes) }.value
+                },
+            )
+            zip.write(bytes)
+            zip.closeEntry()
+        }
+        val buffers = mutableListOf<java.nio.ByteBuffer>()
+        fun extract() = requireNotNull(extractToByteBuffer(0)).also { buffers += it }
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                assertEquals(1, openArchive(fd.fd, file.length(), true))
+                val first = extract()
+                val other = extract()
+                first.put(bytes.lastIndex, 99)
+                releaseByteBuffer(first)
+                val reused = extract()
+                releaseByteBuffer(first)
+                assertEquals(bytes.last(), reused.get(bytes.lastIndex))
+                closeArchive()
+                assertTrue(file.delete())
+                reused.put(0, 77)
+                assertEquals(bytes[0], other.get(0))
+                assertEquals(77.toByte(), reused.get(0))
+            }
+        } finally {
+            buffers.forEach(::releaseByteBuffer)
+            closeArchive()
+            file.delete()
+        }
+    }
+
+    @Test
     fun concurrentReadsAndRepeatedLifetimeDoNotLeakDescriptors() {
         val file = fixture("deflated.zip")
         val before = File("/proc/self/fd").list()?.size ?: 0

@@ -12,6 +12,16 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class VerificationTest {
+    @Test fun benchmarkFlagsDoNotConsumeFollowingOptions() {
+        val options = Options(listOf("--samples", "--loops", "300", "--mutate", "--retained", "64", "--cpu-samples"))
+        assertTrue(options.has("--samples"))
+        assertTrue(options.has("--mutate"))
+        assertTrue(options.has("--cpu-samples"))
+        assertEquals("300", options.get("--loops"))
+        assertEquals("64", options.get("--retained"))
+        rejects { Options(listOf("--samples", "--samples")) }
+    }
+
     @Test fun instrumentationCountsFollowRunnerDiscovery() {
         assertEquals(20, instrumentationTestCount("Time: 1.2\nOK (20 tests)\n"))
         assertEquals(1, instrumentationTestCount("OK (1 test)\r\n"))
