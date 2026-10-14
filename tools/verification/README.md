@@ -105,6 +105,28 @@ JAVA_OPTS='--enable-native-access=ALL-UNNAMED --add-opens=java.base/java.io=ALL-
   --warmup 50 --loops 300
 ```
 
+Add `--samples` to retain all measured operation durations in original order and
+report JVM GC count/time during the measured interval. Collection and serialization
+occur outside operation timers. Use `--warmup 50 --loops 300 --retained 0` and
+`--retained 64` for the existing comparison protocol, interleave independent JVM
+trials, and stop build/emulator work before collecting performance results.
+GC counters cannot attribute native tails or explain an earlier run that did not
+record them; process-wide RSS/fault counts also include JVM startup.
+`--mutate` adds a deterministic byte write to each extracted page as a separate
+dirty-view stress workload. Keep it disabled for the original comparison and do
+not compare its results to read-only trials. The original C implementation does
+not provide the Rust implementation's independent writable-buffer guarantees.
+`--cpu-samples` adds per-operation current-thread CPU durations and start offsets
+for a separate diagnostic run (and implies `--samples`). It requires supported,
+enabled JVM thread CPU timing. Combine it with JDK safepoint logging when
+investigating wall-clock outliers. Do not mix instrumented CPU trials into the
+original latency comparison.
+The page-touch loop and timed extract/touch/release method are separate from
+optional statistics, so adding diagnostic output does not enlarge their JIT
+compilation bodies. Capture GC counters before allocating output sample lists.
+Historical measurements still require caution: a fixed 50-operation warmup is
+not proof that JIT compilation, CPU scheduling or the machine has stabilized.
+
 Repeat independent JVM trials for both ZIP inputs, alternating library order.
 `--retained N` measures extraction with other page buffers still outstanding.
 The workload touches each 4-KiB page and releases it; it does not measure Android

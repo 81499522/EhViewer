@@ -1,6 +1,7 @@
 //! Safe sessions around libarchive. No JNI or Android types occur in this module.
 //! Shared caches use short locks; each libarchive handle remains exclusively owned.
 mod buffer;
+mod stored;
 mod sys;
 use anyhow::{Result, anyhow, bail, ensure};
 pub use buffer::PooledBuffer;
@@ -12,6 +13,8 @@ use std::io::{Read, Write};
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::{Arc, Condvar, Mutex};
+pub use stored::StoredBuffer;
+use stored::StoredPool;
 use sys::*;
 
 const OK: i32 = 0;
@@ -54,7 +57,7 @@ impl Source {
             .position(|(start, map)| *start == offset && map.len() == len)
         {
             let cached = views.remove(index);
-            let map = cached.1.clone();
+            let map = Arc::clone(&cached.1);
             views.push(cached);
             return Ok(map);
         }
@@ -67,7 +70,7 @@ impl Source {
         {
             views.remove(0);
         }
-        views.push((offset, map.clone()));
+        views.push((offset, Arc::clone(&map)));
         Ok(map)
     }
 }
@@ -77,34 +80,6 @@ struct Reader {
     next: usize,
 }
 
-#[cfg(test)]
-mod view_tests {
-    use super::*;
-
-    #[test]
-    fn stored_input_views_are_bounded_and_survive_eviction() {
-        let path = std::env::temp_dir().join(format!("ehviewer-view-cache-{}", std::process::id()));
-        File::create(&path).unwrap().set_len(32 << 20).unwrap();
-        let file = File::open(&path).unwrap();
-        let map = unsafe { MmapOptions::new().map(&file) }.unwrap();
-        let source = Source {
-            file,
-            map,
-            views: Mutex::new(Vec::new()),
-        };
-        let first = source.stored_view(0, 4 << 20).unwrap();
-        for index in 1..8 {
-            let view = source.stored_view(index * (4 << 20), 4 << 20).unwrap();
-            assert_eq!(view[0], 0);
-            let views = source.views.lock().unwrap();
-            assert!(views.len() <= MAX_PARALLEL);
-            assert!(views.iter().map(|(_, map)| map.len()).sum::<usize>() <= CACHE_BYTES);
-        }
-        drop(source);
-        std::fs::remove_file(&path).unwrap();
-        assert_eq!(first[0], 0);
-    }
-}
 // SAFETY: libarchive's README documents independent objects as thread safe but not thread aware.
 // This handle owns its input mapping, uses no callbacks/thread-local state or write_disk APIs,
 // and moves only with exclusive ownership. A pool transfers ownership under a Mutex; no Sync
@@ -239,7 +214,6 @@ impl Reader {
     }
 }
 
-#[derive(Clone)]
 struct Page {
     name: Vec<u8>,
     header: usize,
@@ -248,7 +222,7 @@ struct Page {
     encrypted: bool,
 }
 struct State {
-    password: Option<CString>,
+    password: Option<Arc<CString>>,
     generation: u64,
     pool: Vec<Reader>,
 }
@@ -261,6 +235,7 @@ pub struct ArchiveSession {
     running: Mutex<usize>,
     available: Condvar,
     buffers: Arc<BufferPool>,
+    stored: Arc<StoredPool>,
 }
 struct Slot<'a>(&'a ArchiveSession);
 impl Drop for Slot<'_> {
@@ -275,18 +250,21 @@ impl Drop for Slot<'_> {
 pub enum PageBuffer {
     Owned(PooledBuffer),
     Mapped(MmapMut),
+    Stored(StoredBuffer),
 }
 impl PageBuffer {
     pub fn retained_bytes(&self) -> usize {
         match self {
             Self::Owned(buffer) => buffer.bytes.capacity(),
             Self::Mapped(map) => map.len(),
+            Self::Stored(buffer) => buffer.len(),
         }
     }
     pub fn as_mut_slice(&mut self) -> &mut [u8] {
         match self {
             Self::Owned(b) => &mut b.bytes,
             Self::Mapped(b) => b,
+            Self::Stored(b) => b.as_mut_slice(),
         }
     }
 }
@@ -340,7 +318,7 @@ impl ArchiveSession {
             map,
             views: Mutex::new(Vec::with_capacity(MAX_PARALLEL)),
         });
-        let mut reader = Reader::new(source.clone(), None)?;
+        let mut reader = Reader::new(Arc::clone(&source), None)?;
         let mut pages = Vec::new();
         let (mut count, mut total, mut probe) = (0usize, 0u64, true);
         while let Some(entry) = reader.header()? {
@@ -420,6 +398,7 @@ impl ArchiveSession {
             running: Mutex::new(0),
             available: Condvar::new(),
             buffers: BufferPool::new(),
+            stored: StoredPool::new(),
         })
     }
     pub fn len(&self) -> usize {
@@ -468,15 +447,17 @@ impl ArchiveSession {
                 .filter(|(_, r)| r.next <= page.header)
                 .max_by_key(|(_, r)| r.next)
                 .map(|(i, _)| i);
-            (
-                best.map(|i| state.pool.swap_remove(i)),
-                state.password.clone(),
-                state.generation,
-            )
+            let cached = best.map(|i| state.pool.swap_remove(i));
+            // A new reader needs a password lease outside this lock, not a copied CString.
+            let password = cached
+                .is_none()
+                .then(|| state.password.as_ref().map(Arc::clone))
+                .flatten();
+            (cached, password, state.generation)
         };
         let mut reader = match cached {
             Some(r) => r,
-            None => Reader::new(self.source.clone(), password.as_ref())?,
+            None => Reader::new(Arc::clone(&self.source), password.as_deref())?,
         };
         reader.seek(page.header)?;
         let result = f(&mut reader);
@@ -503,12 +484,17 @@ impl ArchiveSession {
             .ok_or_else(|| anyhow!("Invalid page index"))?;
         if let Some((offset, len)) = page.direct {
             if let Some(mut output) = self.buffers.acquire_stored(len)? {
-                // Bound resident input views as well as decode storage: walking Source.map
-                // directly would retain page-table entries for every stored page ever copied.
                 output
                     .bytes
                     .extend_from_slice(&self.source.stored_view(offset, len)?);
                 return Ok(PageBuffer::Owned(output));
+            }
+            if len <= CACHE_BYTES {
+                return Ok(PageBuffer::Stored(self.stored.acquire(
+                    &self.source,
+                    offset,
+                    len,
+                )?));
             }
             // SAFETY: private independent view with retained file, validated bounds from libarchive.
             return Ok(PageBuffer::Mapped(unsafe {
@@ -549,7 +535,7 @@ impl ArchiveSession {
             return Ok(true);
         }
         let _slot = self.slot()?;
-        let mut reader = Reader::new(self.source.clone(), Some(&candidate))?;
+        let mut reader = Reader::new(Arc::clone(&self.source), Some(&candidate))?;
         // Validate one complete encrypted page, including its authentication trailer. Traversing
         // every encrypted image here would make password entry proportional to the entire gallery.
         if let Some(page) = self
@@ -567,7 +553,7 @@ impl ArchiveSession {
             .state
             .lock()
             .map_err(|_| anyhow!("Archive lock poisoned"))?;
-        state.password = Some(candidate);
+        state.password = Some(Arc::new(candidate));
         state.generation = state.generation.wrapping_add(1);
         state.pool.clear();
         Ok(true)
@@ -662,4 +648,33 @@ pub fn write_zip(inputs: &mut [(File, String)], output: RawFd) -> Result<()> {
         writer.check(unsafe { archive_write_finish_entry(a) })?;
     }
     writer.check(unsafe { archive_write_close(a) })
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    #[test]
+    fn stored_input_views_are_bounded_and_survive_eviction() {
+        let path = std::env::temp_dir().join(format!("ehviewer-view-cache-{}", std::process::id()));
+        File::create(&path).unwrap().set_len(32 << 20).unwrap();
+        let file = File::open(&path).unwrap();
+        let map = unsafe { MmapOptions::new().map(&file) }.unwrap();
+        let source = Source {
+            file,
+            map,
+            views: Mutex::new(Vec::new()),
+        };
+        let first = source.stored_view(0, 4 << 20).unwrap();
+        for index in 1..8 {
+            let view = source.stored_view(index * (4 << 20), 4 << 20).unwrap();
+            assert_eq!(view[0], 0);
+            let views = source.views.lock().unwrap();
+            assert!(views.len() <= MAX_PARALLEL);
+            assert!(views.iter().map(|(_, map)| map.len()).sum::<usize>() <= CACHE_BYTES);
+        }
+        drop(source);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(first[0], 0);
+    }
 }
