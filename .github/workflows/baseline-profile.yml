@@ -18,6 +18,8 @@ jobs:
   baseline-profile:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: '2'
     steps:
       - name: Free disk space
         run: rm -rf "$AGENT_TOOLSDIRECTORY"
@@ -59,11 +61,23 @@ jobs:
           validate-wrappers: true
           cache-read-only: true
 
+      # Finish Kotlin/Rust compilation before starting the emulator. A single-use
+      # Gradle daemon releases compiler memory between these two phases.
+      - name: Build profile APKs
+        run: >-
+          ./gradlew :app:assembleNonMinifiedRelease :benchmark:assembleNonMinifiedRelease
+          -PreleaseAbi=x86_64 -Pkotlin.compiler.execution.strategy=in-process
+          --max-workers=2 --no-daemon --console=plain --stacktrace
+
       - name: Generate Baseline Profile
         run: >-
           ./gradlew :app:generateBaselineProfile -PreleaseAbi=x86_64
+          -Pkotlin.compiler.execution.strategy=in-process
+          '-Dorg.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8 -XX:+UseParallelGC'
+          -Pandroid.testInstrumentationRunnerArguments.class=com.ehviewer.baselineprofile.BaselineProfileGenerator
+          -Pandroid.testInstrumentationRunnerArguments.androidx.benchmark.enabledRules=BaselineProfile
           -Pandroid.testoptions.manageddevices.emulator.gpu=swiftshader_indirect
-          --console=plain --stacktrace
+          --max-workers=2 --no-daemon --console=plain --stacktrace
 
       - name: Upload generated profiles
         uses: actions/upload-artifact@v7
@@ -72,6 +86,16 @@ jobs:
           path: app/src/main/generated/baselineProfiles
           if-no-files-found: error
 
+      - name: Collect host diagnostics
+        if: failure()
+        run: |
+          mkdir -p reports/baseline-host
+          free -h > reports/baseline-host/memory.txt
+          df -h > reports/baseline-host/disk.txt
+          ps -eo pid,ppid,rss,args --sort=-rss | sed -n '1,40p' > reports/baseline-host/processes.txt
+          adb devices -l > reports/baseline-host/devices.txt 2>&1 || true
+          sudo journalctl -k --no-pager | tee reports/baseline-host/kernel.txt > /dev/null
+
       - name: Upload reports
         if: failure()
         uses: actions/upload-artifact@v7
@@ -79,5 +103,7 @@ jobs:
           name: reports
           path: |
             benchmark/build/reports
+            benchmark/build/outputs/androidTest-results
             benchmark/build/outputs/managed_device_android_test_additional_output
             app/build/reports
+            reports/baseline-host

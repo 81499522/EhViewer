@@ -29,6 +29,7 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
         @Parameterized.Parameters(name = "{0}")
         fun cases(): List<Array<String?>> = listOf(
             arrayOf("first-publication", null),
+            arrayOf("nightly-publication", null),
             arrayOf("draft-without-tag", null),
             arrayOf("draft-with-tag", null),
             arrayOf("existing-tag", null),
@@ -61,6 +62,7 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
     }
 
     @Test fun publishStateMachine() = temporary { temp ->
+        val tag = if (scenario == "nightly-publication") "$TEST_TAG-nightly.20261015.1234" else TEST_TAG
         val workflow = generateSequence(Path.of("").toAbsolutePath()) { it.parent }
             .map { it.resolve(".github/workflows/releases.yml") }
             .first(Files::isRegularFile)
@@ -71,7 +73,7 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
         check(script.startsWith("set -euo pipefail"))
         val apks = Files.createDirectories(temp.resolve("apks"))
         val attachments = (abis.keys + "universal").map { abi ->
-            val name = "EhViewer-${TEST_TAG.removePrefix("v")}-$abi.apk"
+            val name = "EhViewer-${tag.removePrefix("v")}-$abi.apk"
             val path = apks.resolve(name).apply { writeText("synthetic APK for $abi") }
             mapOf("name" to name, "sha256" to sha256(path))
         }
@@ -79,7 +81,7 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
             json(
                 mapOf(
                     "source_commit" to if (scenario == "wrong-source") OTHER_SOURCE else RELEASE_SOURCE,
-                    "tag" to TEST_TAG,
+                    "tag" to tag,
                     "source_dirty" to (scenario == "dirty-manifest"),
                     "attachments" to attachments,
                 ),
@@ -118,7 +120,8 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
             this["MOCK_RELEASE_STATE"] = stateFile.absolutePathString()
             this["GH_TOKEN"] = "offline-test-token"
             this["GH_REPO"] = "example/offline"
-            this["RELEASE_TAG"] = TEST_TAG
+            this["RELEASE_TAG"] = tag
+            this["PRERELEASE"] = (scenario == "nightly-publication").toString()
             this["SOURCE_SHA"] = RELEASE_SOURCE
         }
         val process = builder.start()
@@ -174,8 +177,9 @@ object MockReleaseGitHub {
         val calls = state["calls"].array().toMutableList().apply { add(args.toList()) }
         state["calls"] = calls
         val scenario = state.str("scenario")
+        val tag = System.getenv("RELEASE_TAG")
         fun fail(status: Int): Nothing = throw ApiFailure(status)
-        fun release(target: String = RELEASE_SOURCE, draft: Boolean = true): Map<String, Any> = mapOf("tag_name" to TEST_TAG, "target_commitish" to target, "draft" to draft)
+        fun release(target: String = RELEASE_SOURCE, draft: Boolean = true): Map<String, Any> = mapOf("tag_name" to tag, "target_commitish" to target, "draft" to draft)
         fun initialTag(): String? = when (scenario) {
             "draft-with-tag", "existing-tag", "annotated-tag", "nested-tag", "tag-object-error", "non-commit-tag", "cyclic-tag" -> RELEASE_SOURCE
             "conflicting-tag", "conflicting-annotated-tag" -> OTHER_SOURCE
@@ -198,7 +202,7 @@ object MockReleaseGitHub {
                         // Put matching drafts on a subsequent page to exercise pagination.
                         json(listOf(emptyList<Any>(), releases))
                     }
-                    endpoint == "git/ref/tags/$TEST_TAG" -> {
+                    endpoint == "git/ref/tags/$tag" -> {
                         if (scenario == "ref-permission-error") fail(403)
                         val sha = state["tag"] as? String ?: initialTag() ?: fail(404)
                         val type = when (scenario) {
@@ -207,7 +211,7 @@ object MockReleaseGitHub {
                             else -> "commit"
                         }
                         state["tag"] = sha
-                        json(mapOf("ref" to "refs/tags/$TEST_TAG", "object" to mapOf("type" to type, "sha" to if (type == "tag") TAG_OBJECT else sha)))
+                        json(mapOf("ref" to "refs/tags/$tag", "object" to mapOf("type" to type, "sha" to if (type == "tag") TAG_OBJECT else sha)))
                     }
                     endpoint.startsWith("git/tags/") -> {
                         if (scenario == "tag-object-error") fail(422)
@@ -216,20 +220,21 @@ object MockReleaseGitHub {
                     }
                     endpoint == "git/refs" -> {
                         check("--method" in args && "POST" in args)
-                        check("ref=refs/tags/$TEST_TAG" in args && "sha=$RELEASE_SOURCE" in args)
+                        check("ref=refs/tags/$tag" in args && "sha=$RELEASE_SOURCE" in args)
                         if (scenario == "create-permission-error") fail(403)
                         if (scenario == "create-validation-error") fail(422)
                         state["tag"] = if (scenario == "create-race-conflict") OTHER_SOURCE else RELEASE_SOURCE
                         if (scenario.startsWith("create-race-")) fail(if (scenario == "create-race-409") 409 else 422)
-                        json(mapOf("ref" to "refs/tags/$TEST_TAG"))
+                        json(mapOf("ref" to "refs/tags/$tag"))
                     }
                     else -> error("Unexpected API request: ${'$'}{args.toList()}")
                 }
             } else {
-                check(args.first() == "release" && args[2] == TEST_TAG)
+                check(args.first() == "release" && args[2] == tag)
                 when (args[1]) {
                     "create" -> {
                         check("--verify-tag" in args && "--draft" in args)
+                        if (scenario == "nightly-publication") check("--prerelease" in args && "--latest=false" in args)
                         check(args[args.indexOf("--target") + 1] == RELEASE_SOURCE)
                         check(state["tag"] == RELEASE_SOURCE)
                         state["created"] = true
@@ -244,7 +249,12 @@ object MockReleaseGitHub {
                     }
                     "view" -> state["assets"].array().joinToString("\n", postfix = "\n")
                     "edit" -> {
-                        check("--draft=false" in args && "--latest" in args)
+                        check("--draft=false" in args)
+                        if (scenario == "nightly-publication") {
+                            check("--prerelease" in args && "--latest=false" in args && "--latest" !in args)
+                        } else {
+                            check("--latest" in args && "--prerelease" !in args)
+                        }
                         state["published"] = true
                         ""
                     }

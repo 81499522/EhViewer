@@ -5,6 +5,9 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
+  schedule:
+    # Daily at 04:17 Asia/Shanghai; avoid the busiest minute of the hour.
+    - cron: '17 20 * * *'
 
 permissions:
   contents: read
@@ -52,8 +55,8 @@ jobs:
         run: ./gradlew -p tools/verification check installDist --console=plain --no-daemon
       - name: Verify Kotlin boundaries and language policy
         run: tools/verification/build/install/verification/bin/verification architecture
-      - name: Restore original signing for trusted push builds
-        if: github.event_name == 'push'
+      - name: Restore original signing for trusted builds
+        if: github.event_name == 'push' || (github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
@@ -62,7 +65,7 @@ jobs:
         run: |
           set -euo pipefail
           [[ -n "$KEYSTORE_BASE64" && -n "$STORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]] || {
-            echo "::error::Trusted push builds require the original signing credentials."; exit 1;
+            echo "::error::Trusted builds require the original signing credentials."; exit 1;
           }
           umask 077
           mkdir -p .private-signing

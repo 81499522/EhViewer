@@ -426,7 +426,7 @@
     <string name="black_dark_theme">純黑深色主題</string>
     <string name="harmonize_category_color">以動態顏色為分類顏色配色</string>
     <string name="backup_before_update">更新前備份資料</string>
-    <string name="use_ci_update_channel">使用 CI 更新頻道</string>
+    <string name="use_ci_update_channel">使用每日建置更新</string>
     <string name="sort_by">排序方式</string>
     <string name="added_time_desc">加入時間 (遞減)</string>
     <string name="added_time_asc">加入時間 (遞增)</string>

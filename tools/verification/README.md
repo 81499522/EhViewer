@@ -28,7 +28,7 @@ first publication, draft retries, lightweight/annotated tags, creation races and
 API failures, and never contact GitHub or publish assets.
 
 ```sh
-tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.8 \
+tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.9 \
   --sdk "$ANDROID_HOME" --output release-dry-run/apks --private-dir "$PWD/.private-release" --retention-days 180
 tools/verification/build/install/verification/bin/verification device --serial emulator-5560 \
   --sdk "$ANDROID_HOME" --output reports/api26
@@ -61,8 +61,8 @@ Production signing reads `EHVIEWER_KEYSTORE`, `EHVIEWER_STORE_PASSWORD`,
 original keystore at `.private-signing/androidkey.jks` and the three properties
 `storePassword`, `keyAlias`, `keyPassword` in `.private-signing/signing.properties`
 (directory 0700, files 0600). These files must be backed up separately. Never
-replace the production key. Trusted push CI builds restore the original signing key; pull requests and
-secret-free manual CI builds use the debug signing key;
+replace the production key. Trusted push and main schedule/manual CI builds restore the original signing key;
+pull requests and other manual CI builds use the debug signing key;
 `apks --test-signing` accepts this only for SNAPSHOT versions. `-Prelease` fails
 without the original external signing material, and final APK verification
 requires the historical certificate digest.
@@ -139,3 +139,30 @@ Regression archives, expected data and licenses are restored into the ignored
 Gradle prepares Android test assets automatically. A full Git history is required
 (`git fetch --unshallow` for shallow clones). No fixture data is tracked in the
 current tree or included in production APKs. Parser inputs stay inline in Rust.
+
+## Daily Android builds
+
+CI runs daily at 20:17 UTC (04:17 Asia/Shanghai), in addition to existing push,
+pull request and manual checks. After successful main schedule/manual CI, Release
+builds a signed prerelease named vVERSION-nightly.YYYYMMDD.CI_RUN_ID. The date
+and run ID identify the upstream CI run (or manual Release run), so retries
+keep the same version even across UTC dates.
+A main push still selects a stable release. Manual Release runs have a nightly
+checkbox and remain dry runs unless publish is selected.
+
+Daily publication reuses the four-architecture build, original signing, exact
+source/tag/checksum verification and 90-day encrypted diagnostics retention.
+Only four APKs are attached. Daily prereleases never become Latest; stable
+release discovery remains separate. No rolling Git tag is replaced.
+
+The app's daily channel reads public prerelease metadata and browser download
+URLs, with no user token or authenticated Actions artifact download. It selects
+the device ABI, falls back only to universal, and rejects unrelated assets.
+It requires an ahead commit comparison before offering a daily update, so an
+unchanged or delayed older build does not produce a rollback notification.
+Existing ci_update_channel preferences remain valid.
+
+The schedule becomes active after merge into the default branch. GitHub may
+delay scheduled runs and disables inactive public-repository schedules after
+60 days. A manual CI run from main can generate the same daily channel when
+needed. The application currently searches the newest 100 public releases.
