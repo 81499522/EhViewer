@@ -485,7 +485,7 @@
     <string name="app_link_not_verified_title">アプリのリンクが確認されていません</string>
     <string name="open_by_default">デフォルトで開く</string>
     <string name="backup_before_update">更新前にデータをバックアップする</string>
-    <string name="use_ci_update_channel">CI 更新チャンネルを使用する</string>
+    <string name="use_ci_update_channel">毎日ビルドの更新を使用する</string>
     <string name="settings_privacy_require_unlock">ロックの解除を要求する</string>
     <string name="settings_privacy_require_unlock_delay">ロックの遅延</string>
     <string name="settings_privacy_require_unlock_delay_summary">%s 分以内にアプリに戻る場合はロックの解除を要求しません</string>

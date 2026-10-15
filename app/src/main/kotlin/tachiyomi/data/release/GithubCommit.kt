@@ -3,7 +3,7 @@ package tachiyomi.data.release
 import kotlinx.serialization.Serializable
 
 @Serializable
-data class GithubCommitComparison(val commits: List<GithubCommit>)
+data class GithubCommitComparison(val commits: List<GithubCommit>, val status: String)
 
 @Serializable
 data class GithubCommit(val commit: GithubCommitDetail)

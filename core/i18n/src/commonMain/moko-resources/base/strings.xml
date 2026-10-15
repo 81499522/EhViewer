@@ -504,7 +504,7 @@
     <string name="app_link_not_verified_title">App links not verified</string>
     <string name="open_by_default">Open by default</string>
     <string name="backup_before_update">Backup data before update</string>
-    <string name="use_ci_update_channel">Use CI update channel</string>
+    <string name="use_ci_update_channel">Use daily build updates</string>
     <string name="settings_privacy_require_unlock">Require Unlock</string>
     <string name="settings_privacy_require_unlock_delay">Lock Delay</string>
     <string name="settings_privacy_require_unlock_delay_summary">No unlock is required when leaving App and returning within %s minute(s)</string>
@@ -632,7 +632,4 @@
     <string name="blocked_image">Blocked image</string>
     <string name="show_blocked_image">Show blocked image</string>
     <!-- Tachiyomi Reader End-->
-    <string name="github_session_token">GitHub token for CI downloads</string>
-    <string name="github_session_token_summary">Kept only until the app process exits. Leave empty to clear. Public release updates do not require a token.</string>
-    <string name="invalid_github_token">Enter a valid token without control characters (maximum 255 characters).</string>
 </resources>
