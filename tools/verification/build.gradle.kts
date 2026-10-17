@@ -30,6 +30,9 @@ tasks.withType<Test>().configureEach {
     inputs.file(rootDir.resolve("../../.github/workflows/releases.yml"))
         .withPropertyName("releaseWorkflow")
         .withPathSensitivity(PathSensitivity.RELATIVE)
+    inputs.file(rootDir.resolve("../../.github/workflows/ci.yml"))
+        .withPropertyName("ciWorkflow")
+        .withPathSensitivity(PathSensitivity.RELATIVE)
 }
 
 spotless {

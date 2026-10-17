@@ -5,12 +5,10 @@ on:
     branches: ['**']
   pull_request:
   workflow_dispatch:
-  schedule:
-    # Daily at 04:17 Asia/Shanghai; avoid the busiest minute of the hour.
-    - cron: '17 20 * * *'
 
 permissions:
   contents: read
+  actions: read
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
@@ -25,20 +23,67 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+      - name: Plan snapshot
+        id: snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || exit 1
+          [[ $(git rev-parse HEAD) == "$SOURCE_SHA" ]] || exit 1
+          build=true
+          required=$(jq -n --arg sha "$SOURCE_SHA" '["snapshot-" + $sha, "snapshot-diagnostics-" + $sha] + (["arm64-v8a","armeabi-v7a","universal","x86_64"] | map("snapshot-" + $sha + "-" + .))')
+          has_snapshot() {
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts?per_page=100" > "$RUNNER_TEMP/snapshot-artifacts.json" || exit 1
+            jq -e --argjson required "$required" '
+              [.[] | .artifacts[] | select(.expired == false and .size_in_bytes > 0 and .id > 0) | .name] as $available |
+              all($required[]; . as $name | ($available | map(select(. == $name)) | length) == 1)
+            ' "$RUNNER_TEMP/snapshot-artifacts.json" > /dev/null
+          }
+          # jq variables are deliberately expanded by jq, not by the shell.
+          # shellcheck disable=SC2016
+          valid_run='select(.head_branch == "main" and .head_sha == $sha and .event == "push" and .conclusion == "success" and .head_repository.full_name == $repo and .path == ".github/workflows/ci.yml") | .id'
+          if [[ "$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" != pull_request ]]; then
+            gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&head_sha=$SOURCE_SHA&per_page=100" > "$RUNNER_TEMP/snapshot-runs.json"
+            jq -r --arg sha "$SOURCE_SHA" --arg repo "$GITHUB_REPOSITORY" ".[] | .workflow_runs[] | $valid_run" "$RUNNER_TEMP/snapshot-runs.json" > "$RUNNER_TEMP/snapshot-runs.txt"
+            while IFS= read -r run; do
+              [[ "$run" =~ ^[1-9][0-9]*$ ]] || exit 1
+              if has_snapshot "$run"; then build=false; break; fi
+            done < "$RUNNER_TEMP/snapshot-runs.txt"
+            # A rerun changes the current run's status; inspect completed attempts too.
+            if [[ "$build" == true && "$GITHUB_EVENT_NAME" == push ]]; then
+              for ((attempt=GITHUB_RUN_ATTEMPT-1; attempt>=1; attempt--)); do
+                gh api "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$attempt" > "$RUNNER_TEMP/snapshot-attempt.json"
+                if jq -er --arg sha "$SOURCE_SHA" --arg repo "$GITHUB_REPOSITORY" "$valid_run" "$RUNNER_TEMP/snapshot-attempt.json" > /dev/null && has_snapshot "$GITHUB_RUN_ID"; then
+                  build=false; break
+                fi
+              done
+            fi
+          fi
+          if [[ "$build" == false ]]; then echo "Snapshot $SOURCE_SHA is already available; skipping duplicate validation, build and upload."; fi
+          printf 'build=%s\n' "$build" >> "$GITHUB_OUTPUT"
+
       - uses: actions/setup-java@v5
+        if: steps.snapshot.outputs.build == 'true'
         with:
           distribution: temurin
           java-version-file: .java-version
       - name: Native host prerequisites
+        if: steps.snapshot.outputs.build == 'true'
         run: sudo apt-get update && sudo apt-get install -y autoconf automake pkg-config libarchive-dev libwebp-dev
       - name: Rust targets
+        if: steps.snapshot.outputs.build == 'true'
         run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
+        if: steps.snapshot.outputs.build == 'true'
         with:
           workspaces: native/rust
           shared-key: ${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('rust-toolchain.toml', 'native/rust/Cargo.lock') }}
           save-if: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' }}
       - name: Rust format, Core/JNI tests and Android Clippy
+        if: steps.snapshot.outputs.build == 'true'
         working-directory: native/rust
         run: |
           cargo fmt --all -- --check
@@ -48,15 +93,18 @@ jobs:
             cargo clippy --locked --workspace --target "$target" --all-features -- -D warnings
           done
       - uses: gradle/actions/setup-gradle@v6
+        if: steps.snapshot.outputs.build == 'true'
         with:
           validate-wrappers: true
           cache-read-only: ${{ github.event_name == 'pull_request' || github.ref != 'refs/heads/main' }}
       - name: Build and test Kotlin verification tools
+        if: steps.snapshot.outputs.build == 'true'
         run: ./gradlew -p tools/verification check installDist --console=plain --no-daemon
       - name: Verify Kotlin boundaries and language policy
+        if: steps.snapshot.outputs.build == 'true'
         run: tools/verification/build/install/verification/bin/verification architecture
       - name: Restore original signing for trusted builds
-        if: github.event_name == 'push' || (github.ref == 'refs/heads/main' && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'))
+        if: steps.snapshot.outputs.build == 'true' && (github.event_name == 'push' || (github.ref == 'refs/heads/main' && (github.event_name == 'workflow_dispatch')))
         env:
           KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
@@ -72,6 +120,7 @@ jobs:
           printf '%s' "$KEYSTORE_BASE64" | base64 --decode > .private-signing/androidkey.jks
           printf 'storePassword=%s\nkeyAlias=%s\nkeyPassword=%s\n' "$STORE_PASSWORD" "$KEY_ALIAS" "$KEY_PASSWORD" > .private-signing/signing.properties
       - name: Check, test, lint and build
+        if: steps.snapshot.outputs.build == 'true'
         run: >-
           ./gradlew :build-logic:convention:check spotlessCheck
           :app:testDebugUnitTest
@@ -81,6 +130,7 @@ jobs:
           :app:assembleRelease :benchmark:assembleNonMinifiedRelease
           --console=plain --no-daemon
       - name: Verify APK identity, signatures, JNI, ABI and 16KB alignment
+        if: steps.snapshot.outputs.build == 'true'
         run: |
           mkdir -p reports
           test -s app/build/outputs/mapping/release/mapping.txt
@@ -90,32 +140,85 @@ jobs:
           tools/verification/build/install/verification/bin/verification bytecode > reports/android-bytecode.json
           tools/verification/build/install/verification/bin/verification apks app/build/outputs/apk/release --sdk "$ANDROID_HOME" --test-signing > reports/release-apks.json
           tools/verification/build/install/verification/bin/verification apks app/build/outputs/apk/debug --sdk "$ANDROID_HOME" --debug --application-id moe.tarsin.ehviewer.debug > reports/debug-apks.json
-      - name: Upload ARM64
+      - name: Prepare snapshot APKs
+        if: steps.snapshot.outputs.build == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_KEY: ${{ vars.DIAGNOSTICS_PUBLIC_KEY }}
+        run: |
+          args=(prepare-snapshot --sdk "$ANDROID_HOME" --output release-output/snapshot)
+          if [[ "$GITHUB_EVENT_NAME" == push || ("$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" == workflow_dispatch) ]]; then
+            [[ -n "$PUBLIC_KEY" ]] || { echo "::error::Snapshot diagnostics encryption key is required."; exit 1; }
+            args+=(--private-dir "$RUNNER_TEMP/private-snapshot")
+          else
+            args+=(--test-signing)
+          fi
+          tools/verification/build/install/verification/bin/verification "${args[@]}" > reports/snapshot.json
+          if [[ "$GITHUB_EVENT_NAME" == push || ("$GITHUB_REF" == refs/heads/main && "$GITHUB_EVENT_NAME" == workflow_dispatch) ]]; then
+            if [[ "$GITHUB_EVENT_NAME" == push && "$GITHUB_REF" == refs/heads/main ]]; then
+              [[ $(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha) == "$GITHUB_SHA" ]] || { echo "::error::Snapshot source was superseded."; exit 1; }
+            fi
+            umask 077
+            printf '%s\n' "$PUBLIC_KEY" > "$RUNNER_TEMP/snapshot-public.pem"
+            tools/verification/build/install/verification/bin/verification encrypt-diagnostics \
+              --private-dir "$RUNNER_TEMP/private-snapshot/$GITHUB_SHA" --public-key "$RUNNER_TEMP/snapshot-public.pem" --output release-output/snapshot-diagnostics.enc
+          fi
+      - name: Retain encrypted snapshot diagnostics
+        if: steps.snapshot.outputs.build == 'true' && (github.event_name == 'push' || (github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'))
         uses: actions/upload-artifact@v7
         with:
-          name: arm64-v8a-${{ github.sha }}
-          path: app/build/outputs/apk/release/app-arm64-v8a-release.apk
+          name: snapshot-diagnostics-${{ github.sha }}
+          path: release-output/snapshot-diagnostics.enc
           if-no-files-found: error
-      - name: Upload ARM32
+          retention-days: 90
+          overwrite: true
+      - name: Upload snapshot arm64-v8a
+        if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: armeabi-v7a-${{ github.sha }}
-          path: app/build/outputs/apk/release/app-armeabi-v7a-release.apk
+          name: snapshot-${{ github.sha }}-arm64-v8a
+          path: release-output/snapshot/arm64-v8a/*.apk
           if-no-files-found: error
-      - name: Upload x86_64
+          retention-days: 90
+          overwrite: true
+      - name: Upload snapshot armeabi-v7a
+        if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: x86_64-${{ github.sha }}
-          path: app/build/outputs/apk/release/app-x86_64-release.apk
+          name: snapshot-${{ github.sha }}-armeabi-v7a
+          path: release-output/snapshot/armeabi-v7a/*.apk
           if-no-files-found: error
-      - name: Upload universal
+          retention-days: 90
+          overwrite: true
+      - name: Upload snapshot universal
+        if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: universal-${{ github.sha }}
-          path: app/build/outputs/apk/release/app-universal-release.apk
+          name: snapshot-${{ github.sha }}-universal
+          path: release-output/snapshot/universal/*.apk
           if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      - name: Upload snapshot x86_64
+        if: steps.snapshot.outputs.build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-${{ github.sha }}-x86_64
+          path: release-output/snapshot/x86_64/*.apk
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+      - name: Mark complete snapshot
+        if: steps.snapshot.outputs.build == 'true'
+        uses: actions/upload-artifact@v7
+        with:
+          name: snapshot-${{ github.sha }}
+          path: release-output/snapshot/snapshot-manifest.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
       - name: Verification reports
-        if: always()
+        if: steps.snapshot.outputs.build == 'true' && (always())
         uses: actions/upload-artifact@v7
         with:
           name: verification-reports
@@ -124,6 +227,7 @@ jobs:
             app/build/reports/
             core/*/build/reports/
           retention-days: 14
+          overwrite: true
       - name: Remove runner signing material
-        if: always()
-        run: rm -rf .private-signing
+        if: steps.snapshot.outputs.build == 'true' && (always())
+        run: rm -rf .private-signing "$RUNNER_TEMP/private-snapshot" "$RUNNER_TEMP/snapshot-public.pem"

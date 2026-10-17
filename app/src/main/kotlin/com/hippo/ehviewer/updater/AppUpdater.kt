@@ -16,8 +16,10 @@ import kotlin.time.Clock
 import kotlin.time.Duration.Companion.days
 import kotlin.time.Instant
 import okio.Path
+import tachiyomi.data.release.GithubArtifacts
 import tachiyomi.data.release.GithubCommitComparison
 import tachiyomi.data.release.GithubRelease
+import tachiyomi.data.release.GithubWorkflowRuns
 import tachiyomi.data.release.requirePublicApk
 
 private const val API_URL = "https://api.github.com/repos/${BuildConfig.REPO_NAME}"
@@ -31,8 +33,10 @@ object AppUpdater {
         if (forceCheck || interval != 0 && now > last + interval.days) {
             Settings.lastUpdateTime = now.epochSeconds
             if (Settings.useCIUpdateChannel.value) {
-                val releases = ghStatement("$API_URL/releases?per_page=100").executeAndParseAs<List<GithubRelease>>()
-                return findDailyUpdate(BuildConfig.COMMIT_SHA, BuildConfig.REPO_NAME, releases, AppConfig::matchVariant) { from, to ->
+                val runs = ghStatement("$API_URL/actions/workflows/ci.yml/runs?branch=main&event=push&status=success&per_page=100").executeAndParseAs<GithubWorkflowRuns>()
+                return findSnapshotUpdate(BuildConfig.COMMIT_SHA, BuildConfig.REPO_NAME, runs.runs, AppConfig::matchVariant, { id ->
+                    ghStatement("$API_URL/actions/runs/$id/artifacts?per_page=100").executeAndParseAs<GithubArtifacts>()
+                }) { from, to ->
                     ghStatement("$API_URL/compare/$from...$to").executeAndParseAs<GithubCommitComparison>()
                 }
             } else {
@@ -78,4 +82,7 @@ data class Release(
     val version: String,
     val changelog: String,
     val downloadLink: String,
+    val delivery: UpdateDelivery = UpdateDelivery.IN_APP,
 )
+
+enum class UpdateDelivery { IN_APP, BROWSER }

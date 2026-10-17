@@ -61,7 +61,7 @@ Production signing reads `EHVIEWER_KEYSTORE`, `EHVIEWER_STORE_PASSWORD`,
 original keystore at `.private-signing/androidkey.jks` and the three properties
 `storePassword`, `keyAlias`, `keyPassword` in `.private-signing/signing.properties`
 (directory 0700, files 0600). These files must be backed up separately. Never
-replace the production key. Trusted push and main schedule/manual CI builds restore the original signing key;
+replace the production key. Trusted push and main manual CI builds restore the original signing key;
 pull requests and other manual CI builds use the debug signing key;
 `apks --test-signing` accepts this only for SNAPSHOT versions. `-Prelease` fails
 without the original external signing material, and final APK verification
@@ -140,29 +140,53 @@ Gradle prepares Android test assets automatically. A full Git history is require
 (`git fetch --unshallow` for shallow clones). No fixture data is tracked in the
 current tree or included in production APKs. Parser inputs stay inline in Rust.
 
-## Daily Android builds
+## Push-based CI snapshots
 
-CI runs daily at 20:17 UTC (04:17 Asia/Shanghai), in addition to existing push,
-pull request and manual checks. After successful main schedule/manual CI, Release
-builds a signed prerelease named vVERSION-nightly.YYYYMMDD.CI_RUN_ID. The date
-and run ID identify the upstream CI run (or manual Release run), so retries
-keep the same version even across UTC dates.
-A main push still selects a stable release. Manual Release runs have a nightly
-checkbox and remain dry runs unless publish is selected.
+CI snapshots are built on pushes, PR checks and manual CI runs. There is no daily
+APK schedule. Only successful main push runs are offered by the application's
+CI snapshot update channel; PRs, forks, other branches and manual checks are
+excluded from discovery. The independent Baseline Profile schedule is unchanged.
 
-Daily publication reuses the four-architecture build, original signing, exact
-source/tag/checksum verification and 90-day encrypted diagnostics retention.
-Only four APKs are attached. Daily prereleases never become Latest; stable
-release discovery remains separate. No rolling Git tag is replaced.
+CI calls assembleRelease without -Prelease: the APK is optimized as Release,
+with versionName x.y.z-SNAPSHOT and SNAPSHOT=true. Four Actions APK artifacts
+are named snapshot-COMMIT-ABI, each containing exactly one file:
 
-The app's daily channel reads public prerelease metadata and browser download
-URLs, with no user token or authenticated Actions artifact download. It selects
-the device ABI, falls back only to universal, and rejects unrelated assets.
-It requires an ahead commit comparison before offering a daily update, so an
-unchanged or delayed older build does not produce a rollback notification.
-Existing ci_update_channel preferences remain valid.
+- EhViewer-x.y.z-arm64-v8a.apk
+- EhViewer-x.y.z-armeabi-v7a.apk
+- EhViewer-x.y.z-universal.apk
+- EhViewer-x.y.z-x86_64.apk
 
-The schedule becomes active after merge into the default branch. GitHub may
-delay scheduled runs and disables inactive public-repository schedules after
-60 days. A manual CI run from main can generate the same daily channel when
-needed. The application currently searches the newest 100 public releases.
+The snapshot-COMMIT artifact contains the completion manifest. Trusted production-signed
+snapshots retain matching mapping/native symbols in an encrypted
+snapshot-diagnostics-COMMIT artifact for 90 days. APKs and their marker are also
+retained for 90 days. No plaintext diagnostic bundle is uploaded. Non-main
+checks may use test signing and are not application update sources.
+
+Before expensive work, main CI searches paginated successful main push runs for
+the exact full source SHA and all four nonempty, unexpired APK artifacts, the
+completion marker and encrypted diagnostics. A complete existing snapshot skips
+validation, build and upload. A rerun also checks its completed prior attempts.
+Missing, expired or incomplete outputs are rebuilt; API failures fail closed.
+New source commits always require fresh CI.
+
+The application uses public Actions metadata and commit comparison. It selects
+a complete trusted snapshot, offers only an ahead commit, and opens the matching
+ABI artifact (or universal) in the browser. GitHub sign-in is required to download
+Actions artifacts; unzip the artifact and install its APK. There is no app token
+entry or embedded credential. The saved ci_update_channel preference is preserved.
+Stable updates continue to download/install public release APKs in the app.
+
+A successful main push still triggers the stable Release workflow. A new stable
+project version is built with -Prelease and published using the existing four-ABI
+matrix and guarded publisher. An already published stable version is skipped.
+Manual Release remains a dry run by default, with successful trusted main CI required
+for publication. No snapshot tag or nightly GitHub Release is created. Existing
+historical nightly Releases are left intact.
+
+Existing 1.15.9 clients still query prerelease assets for CI updates. Install the
+first new trusted main snapshot manually from Actions, or upgrade through a
+future stable version containing this updater. The project version is not bumped
+by this workflow change. Snapshot discovery queries recent successful main push
+runs and inspects at most 10 trusted runs per check to bound unauthenticated API
+use, then applies the existing GitHub API rate limits. Older retained artifacts
+outside that lookback remain downloadable manually from Actions.

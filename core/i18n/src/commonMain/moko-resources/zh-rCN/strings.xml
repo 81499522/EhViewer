@@ -440,7 +440,8 @@
     <string name="black_dark_theme">纯黑深色主题</string>
     <string name="harmonize_category_color">类别颜色适配动态配色</string>
     <string name="backup_before_update">更新前备份数据</string>
-    <string name="use_ci_update_channel">使用每日构建更新</string>
+    <string name="use_ci_update_channel">使用 CI 快照更新</string>
+    <string name="ci_snapshot_download_hint">将在浏览器中打开 GitHub Actions 下载此快照，需要登录 GitHub。请解压下载的 Artifact 后安装 APK。</string>
     <string name="sort_by">排序依据</string>
     <string name="added_time_desc">添加时间（降序）</string>
     <string name="added_time_asc">添加时间（升序）</string>

@@ -29,7 +29,6 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
         @Parameterized.Parameters(name = "{0}")
         fun cases(): List<Array<String?>> = listOf(
             arrayOf("first-publication", null),
-            arrayOf("nightly-publication", null),
             arrayOf("draft-without-tag", null),
             arrayOf("draft-with-tag", null),
             arrayOf("existing-tag", null),
@@ -62,7 +61,7 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
     }
 
     @Test fun publishStateMachine() = temporary { temp ->
-        val tag = if (scenario == "nightly-publication") "$TEST_TAG-nightly.20261015.1234" else TEST_TAG
+        val tag = TEST_TAG
         val workflow = generateSequence(Path.of("").toAbsolutePath()) { it.parent }
             .map { it.resolve(".github/workflows/releases.yml") }
             .first(Files::isRegularFile)
@@ -121,7 +120,6 @@ class ReleaseWorkflowTest(private val scenario: String, private val expectedErro
             this["GH_TOKEN"] = "offline-test-token"
             this["GH_REPO"] = "example/offline"
             this["RELEASE_TAG"] = tag
-            this["PRERELEASE"] = (scenario == "nightly-publication").toString()
             this["SOURCE_SHA"] = RELEASE_SOURCE
         }
         val process = builder.start()
@@ -234,7 +232,6 @@ object MockReleaseGitHub {
                 when (args[1]) {
                     "create" -> {
                         check("--verify-tag" in args && "--draft" in args)
-                        if (scenario == "nightly-publication") check("--prerelease" in args && "--latest=false" in args)
                         check(args[args.indexOf("--target") + 1] == RELEASE_SOURCE)
                         check(state["tag"] == RELEASE_SOURCE)
                         state["created"] = true
@@ -250,11 +247,7 @@ object MockReleaseGitHub {
                     "view" -> state["assets"].array().joinToString("\n", postfix = "\n")
                     "edit" -> {
                         check("--draft=false" in args)
-                        if (scenario == "nightly-publication") {
-                            check("--prerelease" in args && "--latest=false" in args && "--latest" !in args)
-                        } else {
-                            check("--latest" in args && "--prerelease" !in args)
-                        }
+                        check("--latest" in args && "--prerelease" !in args)
                         state["published"] = true
                         ""
                     }

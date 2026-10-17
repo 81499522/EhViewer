@@ -8,15 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: "Optional expected full version; leave empty for daily prereleases"
+        description: "Optional expected stable version"
         required: false
         type: string
       publish:
         description: "Publish after successful main CI (unchecked = dry run)"
-        default: false
-        type: boolean
-      nightly:
-        description: "Prepare a daily prerelease (publication still requires successful main CI)"
         default: false
         type: boolean
 
@@ -33,9 +29,7 @@ jobs:
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
-       (github.event.workflow_run.event == 'push' ||
-        github.event.workflow_run.event == 'schedule' ||
-        github.event.workflow_run.event == 'workflow_dispatch') &&
+       github.event.workflow_run.event == 'push' &&
        github.event.workflow_run.head_branch == 'main' &&
        github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
@@ -47,7 +41,6 @@ jobs:
       sha: ${{ steps.plan.outputs.sha }}
       publish: ${{ steps.plan.outputs.publish }}
       build: ${{ steps.plan.outputs.build }}
-      nightly: ${{ steps.plan.outputs.nightly }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -60,9 +53,6 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REQUESTED_TAG: ${{ inputs.release_tag }}
           PUBLISH: ${{ github.event_name == 'workflow_run' || inputs.publish == true }}
-          NIGHTLY: ${{ inputs.nightly == true || (github.event_name == 'workflow_run' && github.event.workflow_run.event != 'push') }}
-          SOURCE_RUN_ID: ${{ github.event.workflow_run.id || github.run_id }}
-          SOURCE_RUN_TIME: ${{ github.event.workflow_run.created_at }}
         shell: bash
         run: |
           set -euo pipefail
@@ -71,15 +61,6 @@ jobs:
           [[ "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || {
             echo "::error::Expected a stable project releaseVersion."; exit 1;
           }
-          if [[ "$NIGHTLY" == true ]]; then
-            [[ "$SOURCE_RUN_ID" =~ ^[1-9][0-9]*$ ]] || { echo "::error::Invalid source run ID."; exit 1; }
-            if [[ -z "$SOURCE_RUN_TIME" ]]; then
-              SOURCE_RUN_TIME=$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" --jq '.created_at')
-            fi
-            source_date=${SOURCE_RUN_TIME%%T*}
-            [[ "$source_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || { echo "::error::Invalid source run date."; exit 1; }
-            version="$version-nightly.${source_date//-/}.$SOURCE_RUN_ID"
-          fi
           tag="v$version"
           [[ -z "$REQUESTED_TAG" || "${REQUESTED_TAG#v}" == "$version" ]] || {
             echo "::error::Requested version differs from the checked-out project version ($version)."; exit 1;
@@ -107,7 +88,7 @@ jobs:
               echo "::error::Existing tag points to a different commit."; exit 1;
             }
           fi
-          printf 'tag=%s\nsha=%s\npublish=%s\nbuild=%s\nnightly=%s\n' "$tag" "$source_sha" "$PUBLISH" "$build" "$NIGHTLY" >> "$GITHUB_OUTPUT"
+          printf 'tag=%s\nsha=%s\npublish=%s\nbuild=%s\n' "$tag" "$source_sha" "$PUBLISH" "$build" >> "$GITHUB_OUTPUT"
 
   build:
     needs: prepare
@@ -121,7 +102,6 @@ jobs:
     env:
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       RELEASE_ABI: ${{ matrix.abi }}
-      NIGHTLY: ${{ needs.prepare.outputs.nightly }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -166,7 +146,6 @@ jobs:
           EHVIEWER_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           args=(:app:assembleRelease -Prelease "-PreleaseAbi=$RELEASE_ABI" --console=plain --no-daemon)
-          if [[ "$NIGHTLY" == true ]]; then args+=("-PnightlyVersion=${RELEASE_TAG#v}"); fi
           ./gradlew "${args[@]}"
           git status --porcelain --untracked-files=all
       - name: Verify packaging regression tests
@@ -265,7 +244,6 @@ jobs:
       GH_REPO: ${{ github.repository }}
       RELEASE_TAG: ${{ needs.prepare.outputs.tag }}
       SOURCE_SHA: ${{ needs.prepare.outputs.sha }}
-      PRERELEASE: ${{ needs.prepare.outputs.nightly }}
     steps:
       - uses: actions/download-artifact@v8
         with:
@@ -279,8 +257,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          prerelease=${PRERELEASE:-false}
-          [[ "$prerelease" == true || "$prerelease" == false ]] || { echo "::error::Invalid prerelease mode."; exit 1; }
           version=${RELEASE_TAG#v}
           expected=$(printf 'EhViewer-%s-%s.apk\n' "$version" arm64-v8a "$version" armeabi-v7a "$version" universal "$version" x86_64 | sort)
           actual=$(find apks -type f | sed 's,^.*/,,' | sort)
@@ -346,15 +322,10 @@ jobs:
           verify_tag
           if [[ "$release_count" == 0 ]]; then
             args=(--verify-tag --target "$SOURCE_SHA" --title "$RELEASE_TAG" --generate-notes --draft)
-            if [[ "$prerelease" == true ]]; then args+=(--prerelease --latest=false); fi
             gh release create "$RELEASE_TAG" "${args[@]}"
           fi
           gh release upload "$RELEASE_TAG" apks/*.apk --clobber || exit 1
           gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > published-assets
           printf '%s\n' "$expected" | diff -u - published-assets || exit 1
           verify_tag
-          if [[ "$prerelease" == true ]]; then
-            gh release edit "$RELEASE_TAG" --draft=false --prerelease --latest=false
-          else
-            gh release edit "$RELEASE_TAG" --draft=false --latest
-          fi
+          gh release edit "$RELEASE_TAG" --draft=false --latest

@@ -13,10 +13,6 @@ plugins {
 }
 
 val releaseVersion = "1.15.9"
-val nightlyVersion = providers.gradleProperty("nightlyVersion").orNull
-require(nightlyVersion == null || hasProperty("release") && Regex("${Regex.escape(releaseVersion)}-nightly\\.[0-9]{8}\\.[1-9][0-9]*").matches(nightlyVersion)) {
-    "nightlyVersion must match the current release version, UTC build date and source CI run ID; -Prelease is required"
-}
 
 val supportedAbis = arrayOf("arm64-v8a", "x86_64", "armeabi-v7a")
 val releaseAbi = providers.gradleProperty("releaseAbi").orNull
@@ -80,15 +76,13 @@ android {
     }.standardOutput.asText.get().trim().removePrefix("https://github.com/").removePrefix("git@github.com:")
         .removeSuffix(".git")
 
-    val snapshot = nightlyVersion != null || !hasProperty("release")
+    val snapshot = !hasProperty("release")
 
     defaultConfig {
         applicationId = "moe.tarsin.ehviewer"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         versionCode = 180073
-        versionName = if (nightlyVersion != null) {
-            nightlyVersion
-        } else if (snapshot) {
+        versionName = if (snapshot) {
             "$releaseVersion-SNAPSHOT"
         } else {
             releaseVersion
