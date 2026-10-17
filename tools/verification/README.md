@@ -156,7 +156,9 @@ are named snapshot-COMMIT-ABI, each containing exactly one file:
 - EhViewer-x.y.z-universal.apk
 - EhViewer-x.y.z-x86_64.apk
 
-The snapshot-COMMIT artifact contains the completion manifest. Trusted production-signed
+The snapshot-COMMIT-ARTIFACT_IDS artifact contains the completion manifest and
+binds the exact diagnostic/ARM64/ARM32/universal/x86_64 artifact IDs. Partial
+overwrites on retries invalidate the old marker; mixed attempts are not reused. Trusted production-signed
 snapshots retain matching mapping/native symbols in an encrypted
 snapshot-diagnostics-COMMIT artifact for 90 days. APKs and their marker are also
 retained for 90 days. No plaintext diagnostic bundle is uploaded. Non-main

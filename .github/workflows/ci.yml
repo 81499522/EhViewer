@@ -34,12 +34,15 @@ jobs:
           [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ && "$GITHUB_RUN_ID" =~ ^[1-9][0-9]*$ && "$GITHUB_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]] || exit 1
           [[ $(git rev-parse HEAD) == "$SOURCE_SHA" ]] || exit 1
           build=true
-          required=$(jq -n --arg sha "$SOURCE_SHA" '["snapshot-" + $sha, "snapshot-diagnostics-" + $sha] + (["arm64-v8a","armeabi-v7a","universal","x86_64"] | map("snapshot-" + $sha + "-" + .))')
+          required=$(jq -n --arg sha "$SOURCE_SHA" '["snapshot-diagnostics-" + $sha] + (["arm64-v8a","armeabi-v7a","universal","x86_64"] | map("snapshot-" + $sha + "-" + .))')
           has_snapshot() {
             gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/actions/runs/$1/artifacts?per_page=100" > "$RUNNER_TEMP/snapshot-artifacts.json" || exit 1
-            jq -e --argjson required "$required" '
-              [.[] | .artifacts[] | select(.expired == false and .size_in_bytes > 0 and .id > 0) | .name] as $available |
-              all($required[]; . as $name | ($available | map(select(. == $name)) | length) == 1)
+            jq -e --arg sha "$SOURCE_SHA" --argjson required "$required" '
+              [.[] | .artifacts[] | select(.expired == false and .size_in_bytes > 0 and .id > 0)] as $available |
+              if all($required[]; . as $name | ($available | map(select(.name == $name)) | length) == 1) then
+                [$required[] | . as $name | $available[] | select(.name == $name) | .id | tostring] | join("-") as $ids |
+                ($available | map(select(.name == ("snapshot-" + $sha + "-" + $ids))) | length) == 1
+              else false end
             ' "$RUNNER_TEMP/snapshot-artifacts.json" > /dev/null
           }
           # jq variables are deliberately expanded by jq, not by the shell.
@@ -164,6 +167,7 @@ jobs:
               --private-dir "$RUNNER_TEMP/private-snapshot/$GITHUB_SHA" --public-key "$RUNNER_TEMP/snapshot-public.pem" --output release-output/snapshot-diagnostics.enc
           fi
       - name: Retain encrypted snapshot diagnostics
+        id: snapshot_diagnostics
         if: steps.snapshot.outputs.build == 'true' && (github.event_name == 'push' || (github.ref == 'refs/heads/main' && github.event_name == 'workflow_dispatch'))
         uses: actions/upload-artifact@v7
         with:
@@ -173,6 +177,7 @@ jobs:
           retention-days: 90
           overwrite: true
       - name: Upload snapshot arm64-v8a
+        id: snapshot_arm64
         if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
@@ -182,6 +187,7 @@ jobs:
           retention-days: 90
           overwrite: true
       - name: Upload snapshot armeabi-v7a
+        id: snapshot_arm32
         if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
@@ -191,6 +197,7 @@ jobs:
           retention-days: 90
           overwrite: true
       - name: Upload snapshot universal
+        id: snapshot_universal
         if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
@@ -200,6 +207,7 @@ jobs:
           retention-days: 90
           overwrite: true
       - name: Upload snapshot x86_64
+        id: snapshot_x86
         if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
@@ -212,7 +220,7 @@ jobs:
         if: steps.snapshot.outputs.build == 'true'
         uses: actions/upload-artifact@v7
         with:
-          name: snapshot-${{ github.sha }}
+          name: snapshot-${{ github.sha }}-${{ steps.snapshot_diagnostics.outputs.artifact-id || '0' }}-${{ steps.snapshot_arm64.outputs.artifact-id }}-${{ steps.snapshot_arm32.outputs.artifact-id }}-${{ steps.snapshot_universal.outputs.artifact-id }}-${{ steps.snapshot_x86.outputs.artifact-id }}
           path: release-output/snapshot/snapshot-manifest.json
           if-no-files-found: error
           retention-days: 90

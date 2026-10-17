@@ -18,7 +18,7 @@ class SnapshotUpdateTest {
     private val sha = "a".repeat(40)
     private fun run() = GithubWorkflowRun(42, sha, "main", "push", "completed", "success", ".github/workflows/ci.yml", GithubRepository(repo))
     private fun artifacts(): GithubArtifacts = GithubArtifacts(
-        (listOf("snapshot-$sha", "snapshot-diagnostics-$sha") + listOf("arm64-v8a", "armeabi-v7a", "universal", "x86_64").map { "snapshot-$sha-$it" })
+        (listOf("snapshot-$sha-2-3-4-5-6", "snapshot-diagnostics-$sha") + listOf("arm64-v8a", "armeabi-v7a", "universal", "x86_64").map { "snapshot-$sha-$it" })
             .mapIndexed { index, name -> GithubArtifact(index + 1L, name, false, 100) },
     )
 
@@ -41,7 +41,8 @@ class SnapshotUpdateTest {
         assertEquals("snapshot-$sha-universal", all.snapshotArtifact(sha) { false }?.name)
         for (entry in all.artifacts) {
             assertEquals(null, GithubArtifacts(all.artifacts - entry).snapshotArtifact(sha) { true })
-            for (bad in listOf(entry.copy(expired = true), entry.copy(bytes = 0), entry.copy(id = 0))) {
+            val replaced = if (entry == all.artifacts.first()) emptyList() else listOf(entry.copy(id = entry.id + 100))
+            for (bad in listOf(entry.copy(expired = true), entry.copy(bytes = 0), entry.copy(id = 0)) + replaced) {
                 assertEquals(null, GithubArtifacts(all.artifacts - entry + bad).snapshotArtifact(sha) { true })
             }
         }

@@ -22,7 +22,7 @@ class SnapshotWorkflowTest(private val scenario: String, private val build: Bool
         fun cases(): List<Array<Any?>> = listOf(
             arrayOf("new", true, 1), arrayOf("unchanged", false, 1), arrayOf("paginated", false, 1),
             arrayOf("missing-apk", true, 1), arrayOf("missing-marker", true, 1), arrayOf("missing-diagnostics", true, 1),
-            arrayOf("expired", true, 1), arrayOf("empty", true, 1), arrayOf("duplicate", true, 1),
+            arrayOf("expired", true, 1), arrayOf("empty", true, 1), arrayOf("duplicate", true, 1), arrayOf("replaced-apk", true, 1),
             arrayOf("wrong-sha", true, 1), arrayOf("wrong-branch", true, 1), arrayOf("wrong-workflow", true, 1),
             arrayOf("failed", true, 1), arrayOf("fork", true, 1), arrayOf("pull-request-source", true, 1),
             arrayOf("branch", true, 1), arrayOf("pull-request", true, 1), arrayOf("manual", false, 1),
@@ -119,7 +119,7 @@ object MockSnapshotGitHub {
             "/artifacts?" in endpoint -> {
                 if (scenario == "artifact-api-error") fail()
                 check("--paginate" in args && "--slurp" in args)
-                var names = listOf("snapshot-$sha", "snapshot-diagnostics-$sha") + listOf("arm64-v8a", "armeabi-v7a", "universal", "x86_64").map { "snapshot-$sha-$it" }
+                var names = listOf("snapshot-$sha-2-3-4-5-6", "snapshot-diagnostics-$sha") + listOf("arm64-v8a", "armeabi-v7a", "universal", "x86_64").map { "snapshot-$sha-$it" }
                 names = when (scenario) {
                     "missing-apk" -> names.dropLast(1)
                     "missing-marker" -> names.drop(1)
@@ -128,7 +128,7 @@ object MockSnapshotGitHub {
                     "partial-then-complete" -> if ("/102/" in endpoint) emptyList() else names
                     else -> names
                 }
-                listOf(mapOf("artifacts" to names.mapIndexed { i, name -> mapOf("id" to i + 1, "name" to name, "expired" to (scenario == "expired" && i == 0), "size_in_bytes" to if (scenario == "empty" && i == 0) 0 else 100) }))
+                listOf(mapOf("artifacts" to names.mapIndexed { i, name -> mapOf("id" to if (scenario == "replaced-apk" && i == 2) 999 else i + 1, "name" to name, "expired" to (scenario == "expired" && i == 0), "size_in_bytes" to if (scenario == "empty" && i == 0) 0 else 100) }))
             }
             else -> error("Unexpected API endpoint")
         }

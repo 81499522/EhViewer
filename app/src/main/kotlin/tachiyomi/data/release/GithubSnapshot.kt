@@ -28,11 +28,13 @@ data class GithubRepository(@SerialName("full_name") val name: String)
 @Serializable
 data class GithubArtifacts(val artifacts: List<GithubArtifact>) {
     fun snapshotArtifact(sha: String, matches: (String) -> Boolean): GithubArtifact? {
-        val required = listOf("snapshot-$sha", "snapshot-diagnostics-$sha") +
+        val required = listOf("snapshot-diagnostics-$sha") +
             listOf("arm64-v8a", "armeabi-v7a", "universal", "x86_64").map { "snapshot-$sha-$it" }
         val available = artifacts.filter { !it.expired && it.id > 0 && it.bytes > 0 }
         if (required.any { name -> available.count { it.name == name } != 1 }) return null
-        val apks = available.filter { it.name in required.drop(2) }
+        val ids = required.map { name -> available.single { it.name == name }.id }.joinToString("-")
+        if (available.count { it.name == "snapshot-$sha-$ids" } != 1) return null
+        val apks = available.filter { it.name in required.drop(1) }
         return apks.find { matches("${it.name}.apk") } ?: apks.single { it.name.endsWith("-universal") }
     }
 }
