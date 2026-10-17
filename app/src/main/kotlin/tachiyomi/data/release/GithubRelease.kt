@@ -14,14 +14,7 @@ data class GithubRelease(
     @SerialName("body") val info: String? = null,
     @SerialName("html_url") val releaseLink: String,
     @SerialName("assets") val assets: List<GitHubAssets>,
-    val prerelease: Boolean = false,
-    val draft: Boolean = false,
-    @SerialName("target_commitish") val targetCommitish: String = "",
 ) {
-    val isNightly: Boolean
-        get() = !draft && prerelease && Regex("v[0-9]+\\.[0-9]+\\.[0-9]+-nightly\\.[0-9]{8}\\.[1-9][0-9]*").matches(version) &&
-            Regex("[0-9a-f]{40}").matches(targetCommitish)
-
     fun getDownloadLink(repository: String, matches: (String) -> Boolean = AppConfig::matchVariant): String {
         val apks = assets.filter { it.name.endsWith(".apk") && !it.name.contains("marshmallow", true) }
         val asset = apks.find { matches(it.name) } ?: apks.find { it.name.endsWith("-universal.apk") }

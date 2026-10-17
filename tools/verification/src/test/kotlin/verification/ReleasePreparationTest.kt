@@ -22,18 +22,15 @@ class ReleasePreparationTest(private val scenario: String, private val expectedE
         @Parameterized.Parameters(name = "{0}")
         fun cases(): List<Array<String?>> = listOf(
             arrayOf("stable", null),
-            arrayOf("nightly", null),
-            arrayOf("nightly-manual-ci", null),
             arrayOf("branch-dry-run", null),
             arrayOf("already-published", null),
-            arrayOf("nightly-already-published", null),
-            arrayOf("nightly-bad-run", "Invalid source run ID"),
-            arrayOf("nightly-bad-date", "Invalid source run date"),
             arrayOf("wrong-version", "Requested version differs"),
             arrayOf("manual-other-branch", "Manual publication must run from main"),
             arrayOf("unmerged", "Source is not merged into main"),
             arrayOf("failed-ci", "Successful main CI is required"),
             arrayOf("pr-only-ci", "Successful main CI is required"),
+            arrayOf("manual-ci", null),
+            arrayOf("scheduled-ci", null),
             arrayOf("other-branch-ci", "Successful main CI is required"),
             arrayOf("api-error", "HTTP 403"),
             arrayOf("conflicting-tag", "Existing tag points to a different commit"),
@@ -67,20 +64,12 @@ class ReleasePreparationTest(private val scenario: String, private val expectedE
         val output = temp.resolve("step-output")
         output.writeText("")
         val capture = temp.resolve("capture")
-        val nightly = scenario.startsWith("nightly")
         val publish = scenario != "branch-dry-run"
         val builder = ProcessBuilder("bash", "-c", script).directory(temp.toFile()).redirectErrorStream(true).redirectOutput(capture.toFile())
         builder.environment().apply {
             this["PATH"] = bin.toString() + File.pathSeparator + getValue("PATH")
             this["MOCK_SCENARIO"] = scenario
-            this["NIGHTLY"] = nightly.toString()
             this["PUBLISH"] = publish.toString()
-            this["SOURCE_RUN_ID"] = if (scenario == "nightly-bad-run") "../unsafe" else "1234"
-            this["SOURCE_RUN_TIME"] = when (scenario) {
-                "nightly-bad-date" -> "unsafe"
-                "nightly-manual-ci" -> ""
-                else -> "2026-10-15T20:17:00Z"
-            }
             this["REQUESTED_TAG"] = if (scenario == "wrong-version") "v9.0.0" else ""
             this["GITHUB_EVENT_NAME"] = "workflow_dispatch"
             this["GITHUB_REF"] = if (scenario in setOf("manual-other-branch", "branch-dry-run")) "refs/heads/feature/test" else "refs/heads/main"
@@ -101,10 +90,8 @@ class ReleasePreparationTest(private val scenario: String, private val expectedE
         } else {
             assertEquals(log, 0, process.exitValue())
             val values = output.readText().lineSequence().filter(String::isNotBlank).associate { it.substringBefore('=') to it.substringAfter('=') }
-            val date = if (scenario == "nightly-manual-ci") "20010203" else "20261015"
-            assertEquals(if (nightly) "v2.34.56-nightly.$date.1234" else "v2.34.56", values["tag"])
+            assertEquals("v2.34.56", values["tag"])
             assertEquals(sha, values["sha"])
-            assertEquals(nightly.toString(), values["nightly"])
             assertEquals(publish.toString(), values["publish"])
             assertEquals((!scenario.endsWith("already-published")).toString(), values["build"])
         }
@@ -117,10 +104,6 @@ object MockReleasePreparation {
         check(args.first() == "api")
         val endpoint = args[1]
         when {
-            endpoint == "repos/example/offline/actions/runs/1234" -> {
-                check(args.last() == ".created_at")
-                print("2001-02-03T20:17:00Z")
-            }
             endpoint.startsWith("repos/example/offline/actions/workflows/ci.yml/runs?head_sha=") -> {
                 check("--jq" in args)
                 val run = mapOf(
@@ -128,8 +111,8 @@ object MockReleasePreparation {
                     "conclusion" to if (scenario == "failed-ci") "failure" else "success",
                     "event" to when (scenario) {
                         "pr-only-ci" -> "pull_request"
-                        "nightly-manual-ci" -> "workflow_dispatch"
-                        "nightly" -> "schedule"
+                        "manual-ci" -> "workflow_dispatch"
+                        "scheduled-ci" -> "schedule"
                         else -> "push"
                     },
                 )

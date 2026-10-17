@@ -504,7 +504,8 @@
     <string name="app_link_not_verified_title">App links not verified</string>
     <string name="open_by_default">Open by default</string>
     <string name="backup_before_update">Backup data before update</string>
-    <string name="use_ci_update_channel">Use daily build updates</string>
+    <string name="use_ci_update_channel">Use CI snapshot updates</string>
+    <string name="ci_snapshot_download_hint">Download this snapshot from GitHub Actions in your browser. GitHub sign-in is required. Unzip the downloaded artifact and install the APK.</string>
     <string name="settings_privacy_require_unlock">Require Unlock</string>
     <string name="settings_privacy_require_unlock_delay">Lock Delay</string>
     <string name="settings_privacy_require_unlock_delay_summary">No unlock is required when leaving App and returning within %s minute(s)</string>

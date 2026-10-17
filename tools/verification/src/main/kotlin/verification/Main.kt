@@ -1,7 +1,7 @@
 package verification
 
 fun main(args: Array<String>) {
-    require(args.isNotEmpty()) { "Expected architecture, bytecode, native-sources, apks, diagnostics, prepare-release, release-input-tests, encrypt-diagnostics, decrypt-diagnostics, diagnostics-key or device" }
+    require(args.isNotEmpty()) { "Expected architecture, bytecode, native-sources, apks, diagnostics, prepare-snapshot, prepare-release, release-input-tests, encrypt-diagnostics, decrypt-diagnostics, diagnostics-key or device" }
     val options = Options(args.drop(1))
     fun tools(): AndroidTools = AndroidTools(options.path("--sdk", System.getenv("ANDROID_HOME")))
     val result: Any = when (args[0]) {
@@ -14,6 +14,7 @@ fun main(args: Array<String>) {
         }
         "diagnostics" -> verifyDiagnostics(options.path("--symbols", "app/build/outputs/native-debug-symbols/release/native-debug-symbols.zip"), options.path("--apk-dir", "app/build/outputs/apk/release"), tools())
         "prepare-release" -> prepareRelease(options.path("--apk-dir", "app/build/outputs/apk/release"), tools(), options.path("--output"), options.path("--private-dir"), options.get("--tag"), options.get("--retention-days", "180").toInt(), if (options.has("--abi")) setOf(options.get("--abi")) else abis.keys + "universal")
+        "prepare-snapshot" -> prepareSnapshot(options.path("--apk-dir", "app/build/outputs/apk/release"), tools(), options.path("--output"), options.has("--test-signing"), if (options.has("--private-dir")) options.path("--private-dir") else null)
         "combine-release" -> combineRelease(options.path("--parts"), tools(), options.path("--output"), options.get("--tag"))
         "release-input-tests" -> releaseInputTests(tools())
         "diagnostics-key" -> diagnosticsKey(options.path("--output"))
