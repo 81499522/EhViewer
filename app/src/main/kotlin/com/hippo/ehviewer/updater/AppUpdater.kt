@@ -44,9 +44,8 @@ object AppUpdater {
                 val release = ghStatement(LATEST_RELEASE_URL).executeAndParseAs<GithubRelease>()
                 val latestVersion = release.version.removePrefix("v")
                 val description = release.info.orEmpty()
-                val downloadUrl = release.getDownloadLink(BuildConfig.REPO_NAME)
-                if (latestVersion != curVersion) {
-                    return Release(latestVersion, description, downloadUrl)
+                if (isNewerStableRelease(curVersion, latestVersion)) {
+                    return Release(latestVersion, description, release.getDownloadLink(BuildConfig.REPO_NAME))
                 }
             }
         }
@@ -69,6 +68,21 @@ object AppUpdater {
             },
         )
     }
+}
+
+private val stableVersionPattern = Regex("""(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)""")
+
+internal fun isNewerStableRelease(currentVersion: String, latestVersion: String): Boolean {
+    fun parts(value: String): List<Long>? {
+        if (!stableVersionPattern.matches(value)) return null
+        return value.split('.').map { it.toLongOrNull() ?: return null }
+    }
+    val current = parts(currentVersion.removeSuffix("-SNAPSHOT")) ?: return false
+    val latest = parts(latestVersion) ?: return false
+    for (index in 0..2) {
+        if (latest[index] != current[index]) return latest[index] > current[index]
+    }
+    return currentVersion.endsWith("-SNAPSHOT")
 }
 
 private suspend inline fun ghStatement(
