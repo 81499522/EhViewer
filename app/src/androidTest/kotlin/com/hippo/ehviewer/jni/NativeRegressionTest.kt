@@ -11,6 +11,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -199,6 +200,110 @@ class NativeRegressionTest {
     }
 
     @Test
+    fun readonlyLeasesRejectWritesAndSurviveCloseUnlinkAndDuplicateRelease() {
+        for (name in listOf("stored.zip", "deflated.zip", "password.zip")) {
+            val file = fixture(name)
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                try {
+                    assertEquals(3, openArchive(fd.fd, file.length(), true))
+                    if (needPassword()) assertTrue(providePassword("baseline"))
+                    val first = requireNotNull(extractForReading(0, false))
+                    val other = requireNotNull(extractForReading(0, false))
+                    assertTrue(first.isDirect && first.isReadOnly)
+                    for (view in listOf(first, first.duplicate(), first.slice())) {
+                        assertTrue(view.isReadOnly)
+                        assertThrows(java.nio.ReadOnlyBufferException::class.java) { view.put(0, 1) }
+                        assertTrue(runCatching { rewriteGifSource(view) }.isFailure)
+                    }
+                    releaseByteBuffer(first.duplicate())
+                    val writable = requireNotNull(extractToByteBuffer(0))
+                    writable.put(0, 'x'.code.toByte())
+                    assertEquals('o'.code.toByte(), first.get(0))
+                    releaseByteBuffer(writable)
+                    releaseByteBuffer(first)
+                    val reused = requireNotNull(extractForReading(0, false))
+                    releaseByteBuffer(first) // Same mapped address, different Java identity.
+                    closeArchive()
+                    file.delete()
+                    assertEquals('o'.code.toByte(), other.get(0))
+                    assertEquals('o'.code.toByte(), reused.get(0))
+                    releaseByteBuffer(other)
+                    releaseByteBuffer(reused)
+                    releaseByteBuffer(reused)
+                } finally {
+                    closeArchive()
+                }
+            }
+            file.delete()
+        }
+    }
+
+    @Test
+    fun sharedReadonlyAddressesStillObeyTheRegistrationLimit() {
+        val file = fixture("stored.zip")
+        val held = mutableListOf<java.nio.ByteBuffer>()
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                assertEquals(3, openArchive(fd.fd, file.length(), true))
+                repeat(128) { held += requireNotNull(extractForReading(0, false)) }
+                assertEquals(null, extractForReading(0, false))
+                val released = held.removeAt(0)
+                releaseByteBuffer(released)
+                held += requireNotNull(extractForReading(0, false))
+                releaseByteBuffer(released)
+                assertEquals(null, extractForReading(0, false))
+                closeArchive()
+                held.forEach { assertEquals('o'.code.toByte(), it.get(0)) }
+            }
+        } finally {
+            held.forEach(::releaseByteBuffer)
+            closeArchive()
+            file.delete()
+        }
+    }
+
+    @Test
+    fun gifWorkaroundUsesContentMagicAndIndependentWritableStorage() {
+        val file = File(context.cacheDir, "native-readonly-gif.zip")
+        val bytes = "GIF89a".toByteArray() + byteArrayOf(0, 0x21, 0xf9.toByte(), 4, 0, 1, 0, 0, 0)
+        for (stored in listOf(true, false)) {
+            java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+                val entry = java.util.zip.ZipEntry("renamed.jpg")
+                if (stored) {
+                    entry.method = java.util.zip.ZipEntry.STORED
+                    entry.size = bytes.size.toLong()
+                    entry.compressedSize = entry.size
+                    entry.crc = java.util.zip.CRC32().apply { update(bytes) }.value
+                }
+                zip.putNextEntry(entry)
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                try {
+                    assertEquals(1, openArchive(fd.fd, file.length(), true))
+                    val readonly = requireNotNull(extractForReading(0, false))
+                    val writable = requireNotNull(extractForReading(0, true))
+                    try {
+                        assertTrue(readonly.isReadOnly)
+                        assertFalse(writable.isReadOnly)
+                        rewriteGifSource(writable)
+                        closeArchive()
+                        assertEquals(10.toByte(), writable.get(11))
+                        assertEquals(1.toByte(), readonly.get(11))
+                    } finally {
+                        releaseByteBuffer(readonly)
+                        releaseByteBuffer(writable)
+                    }
+                } finally {
+                    closeArchive()
+                }
+            }
+        }
+        file.delete()
+    }
+
+    @Test
     fun recycledBuffersAndSlicedGifViewsRemainIndependent() {
         val file = java.io.File(instrumentation.targetContext.cacheDir, "native-reuse.zip")
         val bytes = "xxGIF89a".toByteArray() + byteArrayOf(0, 0x21, 0xf9.toByte(), 4, 0, 1, 0, 0, 0)
@@ -283,7 +388,11 @@ class NativeRegressionTest {
 
     @Test
     fun concurrentReadsAndRepeatedLifetimeDoNotLeakDescriptors() {
-        val file = fixture("deflated.zip")
+        for (name in listOf("stored.zip", "deflated.zip")) checkConcurrentLifetimes(name)
+    }
+
+    private fun checkConcurrentLifetimes(name: String) {
+        val file = fixture(name)
         val before = File("/proc/self/fd").list()?.size ?: 0
         repeat(30) {
             ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
@@ -295,8 +404,9 @@ class NativeRegressionTest {
                             pool.submit {
                                 repeat(20) { n ->
                                     val index = (worker + n) % 3
-                                    val buffer = requireNotNull(extractToByteBuffer(index))
+                                    val buffer = requireNotNull(if (n % 2 == 0) extractForReading(index, false) else extractToByteBuffer(index))
                                     try {
+                                        assertEquals(n % 2 == 0, buffer.isReadOnly)
                                         val bytes = ByteArray(buffer.capacity())
                                         buffer.get(bytes)
                                         assertArrayEquals(listOf("one", "two", "ten")[index].toByteArray(), bytes)

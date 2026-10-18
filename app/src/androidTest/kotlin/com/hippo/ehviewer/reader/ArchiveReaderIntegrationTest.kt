@@ -5,6 +5,8 @@ import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.hippo.ehviewer.gallery.useArchivePageLoader
 import com.hippo.ehviewer.image.ByteBufferSource
+import com.hippo.ehviewer.image.Image
+import com.hippo.ehviewer.image.byteBufferSource
 import com.hippo.ehviewer.reader.data.NativeArchiveReader
 import java.io.File
 import kotlinx.coroutines.runBlocking
@@ -92,6 +94,67 @@ class ArchiveReaderIntegrationTest {
         } finally {
             source?.close()
             source?.close()
+            file.delete()
+        }
+    }
+
+    @Test
+    fun actualImageDecoderConsumesReadonlyImagesAndTheGifWorkaround() = runBlocking {
+        val bitmap = android.graphics.Bitmap.createBitmap(16, 16, android.graphics.Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(android.graphics.Color.RED)
+        val png = java.io.ByteArrayOutputStream().use { output ->
+            check(bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, output))
+            output.toByteArray()
+        }
+        val jpeg = java.io.ByteArrayOutputStream().use { output ->
+            check(bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, output))
+            output.toByteArray()
+        }
+
+        @Suppress("DEPRECATION")
+        val webp = java.io.ByteArrayOutputStream().use { output ->
+            check(bitmap.compress(android.graphics.Bitmap.CompressFormat.WEBP, 90, output))
+            output.toByteArray()
+        }
+        bitmap.recycle()
+        val gif = android.util.Base64.decode("R0lGODlhAQABAIAAAAAAAP///ywAAAAAAQABAAACAUwAOw==", android.util.Base64.DEFAULT)
+        val file = File(context.cacheDir, "reader-real-images.zip")
+        try {
+            for (stored in listOf(true, false)) {
+                java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+                    for ((index, data) in listOf(png, jpeg, gif, webp).withIndex()) {
+                        val entry = java.util.zip.ZipEntry("page${index + 1}.${listOf("png", "jpg", "gif", "webp")[index]}")
+                        if (stored) {
+                            entry.method = java.util.zip.ZipEntry.STORED
+                            entry.size = data.size.toLong()
+                            entry.compressedSize = entry.size
+                            entry.crc = java.util.zip.CRC32().apply { update(data) }.value
+                        }
+                        zip.putNextEntry(entry)
+                        zip.write(data)
+                        zip.closeEntry()
+                    }
+                }
+                ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                    NativeArchiveReader.open(fd.fd, file.length(), true).use { reader ->
+                        for (index in 0..3) {
+                            val page = reader.read(index)
+                            page.use {
+                                if (index != 2) assertTrue(page.buffer.isReadOnly)
+                                val image = Image.decode(byteBufferSource(page.buffer) { page.close() })
+                                try {
+                                    val expected = if (index == 2) 1 else 16
+                                    assertEquals(expected, image.intrinsicSize.width)
+                                    assertEquals(expected, image.intrinsicSize.height)
+                                } finally {
+                                    image.unpin()
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } finally {
             file.delete()
         }
     }

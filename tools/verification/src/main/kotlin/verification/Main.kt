@@ -10,7 +10,7 @@ fun main(args: Array<String>) {
         "native-sources" -> verifyNativeSources()
         "apks" -> {
             if (options.has("--test-signing")) require(apkInputs(readJson(root.resolve(options.positional.single()).resolve("output-metadata.json")), "moe.tarsin.ehviewer").all { it.version.endsWith("-SNAPSHOT") }) { "Test signing is allowed only for CI snapshots" }
-            verifyApks(root.resolve(options.positional.single()), tools(), options.get("--application-id", "moe.tarsin.ehviewer"), !options.has("--debug") && !options.has("--test-signing"), if (options.has("--version-code")) options.get("--version-code").toInt() else null)
+            verifyApks(root.resolve(options.positional.single()), tools(), options.get("--application-id", "moe.tarsin.ehviewer"), !options.has("--debug") && !options.has("--test-signing"), if (options.has("--version-code")) options.get("--version-code").toInt() else null, if (options.has("--abi")) setOf(options.get("--abi")) else abis.keys + "universal")
         }
         "diagnostics" -> verifyDiagnostics(options.path("--symbols", "app/build/outputs/native-debug-symbols/release/native-debug-symbols.zip"), options.path("--apk-dir", "app/build/outputs/apk/release"), tools())
         "prepare-release" -> prepareRelease(options.path("--apk-dir", "app/build/outputs/apk/release"), tools(), options.path("--output"), options.path("--private-dir"), options.get("--tag"), options.get("--retention-days", "180").toInt(), if (options.has("--abi")) setOf(options.get("--abi")) else abis.keys + "universal")
@@ -21,8 +21,10 @@ fun main(args: Array<String>) {
         "encrypt-diagnostics" -> encryptDiagnostics(options.path("--private-dir"), options.path("--public-key"), options.path("--output"))
         "decrypt-diagnostics" -> decryptDiagnostics(options.path("--input"), options.path("--private-key"), options.path("--output"))
         "device" -> deviceTests(tools().sdk, options.get("--serial"), options.path("--output"), options.path("--app", "app/build/outputs/apk/debug/app-universal-debug.apk"), options.path("--test-apk", "app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk"))
-        "native-benchmark-inputs" -> com.hippo.ehviewer.jni.benchmarkArchives(options.path("--output"))
+        "native-benchmark-inputs" -> com.hippo.ehviewer.jni.benchmarkArchives(options)
         "native-benchmark" -> com.hippo.ehviewer.jni.nativeArchiveBenchmark(options)
+        "native-differential" -> com.hippo.ehviewer.jni.nativeArchiveDifferential(options)
+        "native-regression" -> com.hippo.ehviewer.jni.nativeArchiveRegression(options)
         else -> error("Unknown command: ${args[0]}")
     }
     println(json(result))

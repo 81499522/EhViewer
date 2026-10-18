@@ -252,6 +252,56 @@ pub enum PageBuffer {
     Mapped(MmapMut),
     Stored(StoredBuffer),
 }
+
+/// Immutable output with an ownership pin, rather than a borrowed session lifetime. Stored pages
+/// share the validated input mapping; decoded pages retain their exclusively owned allocation.
+/// No mutable view of either representation is exposed by this type.
+pub struct ReadOnlyPageBuffer(ReadOnlyStorage);
+enum ReadOnlyStorage {
+    Source {
+        source: Arc<Source>,
+        offset: usize,
+        len: usize,
+    },
+    Decoded(PooledBuffer),
+}
+impl ReadOnlyPageBuffer {
+    pub fn as_slice(&self) -> &[u8] {
+        match &self.0 {
+            ReadOnlyStorage::Source {
+                source,
+                offset,
+                len,
+            } => &source.map[*offset..*offset + *len],
+            ReadOnlyStorage::Decoded(buffer) => &buffer.bytes,
+        }
+    }
+    pub fn retained_bytes(&self) -> usize {
+        match &self.0 {
+            ReadOnlyStorage::Source { len, .. } => *len,
+            ReadOnlyStorage::Decoded(buffer) => buffer.bytes.capacity(),
+        }
+    }
+    /// GIF patching is the exceptional writable consumer. Decoded storage transfers ownership;
+    /// a mapped source is copied into an independent allocation before any writes are possible.
+    pub fn into_writable(self) -> Result<PageBuffer> {
+        match self.0 {
+            ReadOnlyStorage::Decoded(buffer) => Ok(PageBuffer::Owned(buffer)),
+            ReadOnlyStorage::Source {
+                source,
+                offset,
+                len,
+            } => {
+                let pool = BufferPool::new();
+                let mut output = pool.acquire(len)?;
+                output
+                    .bytes
+                    .extend_from_slice(&source.map[offset..offset + len]);
+                Ok(PageBuffer::Owned(output))
+            }
+        }
+    }
+}
 impl PageBuffer {
     pub fn retained_bytes(&self) -> usize {
         match self {
@@ -299,8 +349,8 @@ pub fn safe_path(name: &[u8]) -> bool {
 }
 impl ArchiveSession {
     /// # Safety
-    /// The backing file must not be modified or truncated until this session and every returned
-    /// mapped PageBuffer have been dropped. Unlinking/closing the caller's fd is safe.
+    /// The backing file must remain unmodified/untruncated until this session and every returned
+    /// mapped lease (writable or read-only) has been dropped. Closing/unlinking the caller's fd is safe.
     pub unsafe fn open(file: File, size: u64, sort: bool, limits: Limits) -> Result<Self> {
         ensure!(
             size > 0 && size <= limits.archive_bytes && size <= isize::MAX as u64,
@@ -504,11 +554,32 @@ impl ArchiveSession {
                     .map_copy(&self.source.file)?
             }));
         }
+        Ok(PageBuffer::Owned(self.decode(page)?))
+    }
+    fn decode(&self, page: &Page) -> Result<PooledBuffer> {
         self.with_reader(page, |reader| {
             let mut output = self.buffers.acquire(page.size as usize)?;
             reader.read_into(page.size as usize, &mut output.bytes)?;
-            Ok(PageBuffer::Owned(output))
+            Ok(output)
         })
+    }
+    pub fn extract_readonly(&self, index: usize) -> Result<ReadOnlyPageBuffer> {
+        let page = self
+            .pages
+            .get(index)
+            .ok_or_else(|| anyhow!("Invalid page index"))?;
+        if let Some((offset, len)) = page.direct {
+            // The range was validated against this exact mapping during open. Arc pins the file
+            // and mapping after close/unlink; readers share bytes but cannot obtain &mut [u8].
+            return Ok(ReadOnlyPageBuffer(ReadOnlyStorage::Source {
+                source: Arc::clone(&self.source),
+                offset: offset as usize,
+                len,
+            }));
+        }
+        Ok(ReadOnlyPageBuffer(ReadOnlyStorage::Decoded(
+            self.decode(page)?,
+        )))
     }
     pub fn extract_to(&self, index: usize, mut output: impl Write) -> Result<()> {
         let page = self

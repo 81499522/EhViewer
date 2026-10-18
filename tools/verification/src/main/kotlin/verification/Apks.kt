@@ -12,7 +12,7 @@ import kotlin.io.path.writeBytes
 
 val jniExports = setOf("JNI_OnLoad", "Java_com_hippo_ehviewer_jni_HashKt_sha1") +
     listOf(
-        "openArchive", "closeArchive", "extractToByteBuffer", "extractToFd", "releaseByteBuffer",
+        "openArchive", "closeArchive", "extractToByteBuffer", "extractForReading", "extractToFd", "releaseByteBuffer",
         "getExtension", "needPassword", "providePassword", "archiveFdBatch",
     ).map { "Java_com_hippo_ehviewer_jni_ArchiveKt_$it" } +
     listOf("isGif", "rewriteGifSource", "mmap", "munmap").map { "Java_com_hippo_ehviewer_jni_GifUtilsKt_$it" }

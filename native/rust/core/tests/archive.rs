@@ -63,6 +63,106 @@ fn buffers_outlive_session_and_are_independent() {
 }
 
 #[test]
+fn readonly_leases_share_only_immutable_bytes_and_outlive_the_session() {
+    for name in [
+        "stored.zip",
+        "deflated.zip",
+        "password.zip",
+        "pages.7z",
+        "stored.rar",
+    ] {
+        let session = open(name, true);
+        if session.needs_password() {
+            assert!(session.extract_readonly(0).is_err());
+            assert!(!session.provide_password("wrong").unwrap());
+            assert!(session.extract_readonly(0).is_err());
+            assert!(session.provide_password("baseline").unwrap());
+        }
+        let first = session.extract_readonly(0).unwrap();
+        let other = session.extract_readonly(0).unwrap();
+        let expected = first.as_slice().to_vec();
+        if name == "stored.zip" {
+            assert_eq!(first.as_slice().as_ptr(), other.as_slice().as_ptr());
+        }
+        let mut writable = session.extract(0).unwrap();
+        writable.as_mut_slice()[0] ^= 0xff;
+        assert_eq!(first.as_slice(), expected);
+        let address = first.as_slice().as_ptr();
+        let mut converted = first.into_writable().unwrap();
+        if name == "deflated.zip" {
+            assert_eq!(address, converted.as_mut_slice().as_ptr());
+        }
+        converted.as_mut_slice()[0] ^= 0xff;
+        assert_eq!(other.as_slice(), expected);
+        assert!(session.extract_readonly(session.len()).is_err());
+        drop(session);
+        assert_eq!(other.as_slice(), expected);
+        assert_eq!(converted.as_mut_slice()[0], expected[0] ^ 0xff);
+    }
+}
+
+#[test]
+fn parallel_readonly_and_writable_leases_never_share_writes() {
+    for name in ["stored.zip", "deflated.zip", "password.zip"] {
+        let session = open(name, true);
+        if session.needs_password() {
+            assert!(session.provide_password("baseline").unwrap());
+        }
+        std::thread::scope(|scope| {
+            for thread in 0..8 {
+                let session = &session;
+                scope.spawn(move || {
+                    for iteration in 0..100 {
+                        let index = (thread + iteration) % 3;
+                        let expected = [b"one".as_slice(), b"two", b"ten"][index];
+                        let readonly = session.extract_readonly(index).unwrap();
+                        let mut writable = session.extract(index).unwrap();
+                        writable.as_mut_slice().fill(255);
+                        assert_eq!(readonly.as_slice(), expected);
+                    }
+                });
+            }
+        });
+    }
+}
+
+#[test]
+fn readonly_mapping_survives_fd_close_unlink_and_cache_eviction() {
+    let directory = std::env::temp_dir().join(format!("ehviewer-readonly-{}", std::process::id()));
+    fs::create_dir_all(&directory).unwrap();
+    let payload = directory.join("input");
+    File::create(&payload).unwrap().set_len(17 << 20).unwrap();
+    let archive = directory.join("pages.zip");
+    let output = File::create(&archive).unwrap();
+    write_zip(
+        &mut [(File::open(&payload).unwrap(), "page.jpg".into())],
+        output.as_raw_fd(),
+    )
+    .unwrap();
+    drop(output);
+    let file = File::open(&archive).unwrap();
+    let session = unsafe {
+        ArchiveSession::open(
+            file,
+            fs::metadata(&archive).unwrap().len(),
+            true,
+            Limits::default(),
+        )
+    }
+    .unwrap();
+    let held = session.extract_readonly(0).unwrap();
+    let address = held.as_slice().as_ptr();
+    for _ in 0..100 {
+        let other = session.extract_readonly(0).unwrap();
+        assert_eq!(other.as_slice().as_ptr(), address);
+    }
+    drop(session);
+    fs::remove_dir_all(directory).unwrap();
+    assert_eq!(held.as_slice().len(), 17 << 20);
+    assert!(held.as_slice().iter().all(|&byte| byte == 0));
+}
+
+#[test]
 fn recycled_buffers_never_publish_previous_mutations() {
     for name in ["stored.zip", "deflated.zip", "password.zip"] {
         let session = open(name, true);
@@ -294,6 +394,7 @@ fn tar_filters_and_malformed_mutations() {
         } {
             for index in 0..session.len() {
                 let _ = session.extract(index);
+                let _ = session.extract_readonly(index);
             }
         }
     }
