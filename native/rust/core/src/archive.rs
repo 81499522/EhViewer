@@ -12,7 +12,7 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 pub use stored::StoredBuffer;
 use stored::StoredPool;
 use sys::*;
@@ -63,7 +63,7 @@ impl Source {
         }
         ensure!(len <= CACHE_BYTES, "Stored view exceeds cache budget");
         // SAFETY: offset/length come from a validated libarchive block; the same immutable-file
-        // contract as Source.map applies. This cache is read-only and never exposed to Java.
+        // contract as Source.map applies. Only immutable slices/read-only Java views escape.
         let map = Arc::new(unsafe { MmapOptions::new().offset(offset).len(len).map(&self.file)? });
         while views.len() >= MAX_PARALLEL
             || views.iter().map(|(_, map)| map.len()).sum::<usize>() > CACHE_BYTES - len
@@ -219,6 +219,8 @@ struct Page {
     header: usize,
     size: u64,
     direct: Option<(u64, usize)>,
+    // Weak ownership avoids pinning every visited page; live leases still share one immutable view.
+    readonly: Mutex<Weak<Mmap>>,
     encrypted: bool,
 }
 struct State {
@@ -263,9 +265,47 @@ enum ReadOnlyStorage {
         offset: usize,
         len: usize,
     },
+    View(Arc<Mmap>),
     Decoded(PooledBuffer),
 }
+/// Weak allocation/range identity, never a data pointer or an owner of mapped bytes.
+/// Its control block prevents allocation-identity reuse while cached metadata survives.
+pub struct ReadOnlyIdentity(IdentityStorage);
+enum IdentityStorage {
+    Source(Weak<Source>, usize, usize),
+    View(Weak<Mmap>),
+}
+impl ReadOnlyIdentity {
+    /// Equality observes identity only. Access still requires a live ReadOnlyPageBuffer lease.
+    pub fn same_backing(&self, other: &Self) -> bool {
+        match (&self.0, &other.0) {
+            (IdentityStorage::Source(a, ao, al), IdentityStorage::Source(b, bo, bl)) => {
+                Weak::ptr_eq(a, b) && ao == bo && al == bl
+            }
+            (IdentityStorage::View(a), IdentityStorage::View(b)) => Weak::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+}
 impl ReadOnlyPageBuffer {
+    /// Identity for metadata caches. Decoded allocations are exclusive and have no shared key.
+    pub fn mapping_identity(&self) -> Option<ReadOnlyIdentity> {
+        match &self.0 {
+            ReadOnlyStorage::Source {
+                source,
+                offset,
+                len,
+            } => Some(ReadOnlyIdentity(IdentityStorage::Source(
+                Arc::downgrade(source),
+                *offset,
+                *len,
+            ))),
+            ReadOnlyStorage::View(map) => {
+                Some(ReadOnlyIdentity(IdentityStorage::View(Arc::downgrade(map))))
+            }
+            ReadOnlyStorage::Decoded(_) => None,
+        }
+    }
     pub fn as_slice(&self) -> &[u8] {
         match &self.0 {
             ReadOnlyStorage::Source {
@@ -273,12 +313,14 @@ impl ReadOnlyPageBuffer {
                 offset,
                 len,
             } => &source.map[*offset..*offset + *len],
+            ReadOnlyStorage::View(map) => map,
             ReadOnlyStorage::Decoded(buffer) => &buffer.bytes,
         }
     }
     pub fn retained_bytes(&self) -> usize {
         match &self.0 {
             ReadOnlyStorage::Source { len, .. } => *len,
+            ReadOnlyStorage::View(map) => map.len(),
             ReadOnlyStorage::Decoded(buffer) => buffer.bytes.capacity(),
         }
     }
@@ -297,6 +339,12 @@ impl ReadOnlyPageBuffer {
                 output
                     .bytes
                     .extend_from_slice(&source.map[offset..offset + len]);
+                Ok(PageBuffer::Owned(output))
+            }
+            ReadOnlyStorage::View(map) => {
+                let pool = BufferPool::new();
+                let mut output = pool.acquire(map.len())?;
+                output.bytes.extend_from_slice(&map);
                 Ok(PageBuffer::Owned(output))
             }
         }
@@ -407,6 +455,7 @@ impl ArchiveSession {
                 header: reader.next - 1,
                 size: length as u64,
                 direct: None,
+                readonly: Mutex::new(Weak::new()),
                 encrypted: unsafe { archive_entry_is_encrypted(entry) } != 0,
             };
             if probe && unsafe { archive_entry_is_encrypted(entry) } == 0 && length > 0 {
@@ -569,6 +618,35 @@ impl ArchiveSession {
             .get(index)
             .ok_or_else(|| anyhow!("Invalid page index"))?;
         if let Some((offset, len)) = page.direct {
+            if self.source.map.len() > CACHE_BYTES {
+                // A full-source borrow makes every touched payload stay mapped in one growing
+                // working set. Bound cached views for large archives; weak per-page ownership
+                // still reuses live leases without retaining pages after cache eviction.
+                let mut slot = page
+                    .readonly
+                    .lock()
+                    .map_err(|_| anyhow!("Read-only view lock poisoned"))?;
+                let map = match slot.upgrade() {
+                    Some(map) => map,
+                    None => {
+                        let map = if len <= CACHE_BYTES {
+                            self.source.stored_view(offset, len)?
+                        } else {
+                            // SAFETY: this is a validated immutable file range. The map owns its
+                            // OS mapping independently of the reader/fd; only immutable slices escape.
+                            Arc::new(unsafe {
+                                MmapOptions::new()
+                                    .offset(offset)
+                                    .len(len)
+                                    .map(&self.source.file)?
+                            })
+                        };
+                        *slot = Arc::downgrade(&map);
+                        map
+                    }
+                };
+                return Ok(ReadOnlyPageBuffer(ReadOnlyStorage::View(map)));
+            }
             // The range was validated against this exact mapping during open. Arc pins the file
             // and mapping after close/unlink; readers share bytes but cannot obtain &mut [u8].
             return Ok(ReadOnlyPageBuffer(ReadOnlyStorage::Source {
@@ -726,6 +804,57 @@ mod view_tests {
     use super::*;
 
     #[test]
+    fn weak_identities_include_range_and_do_not_retain_source_or_allow_owner_reuse() {
+        let path =
+            std::env::temp_dir().join(format!("ehviewer-readonly-id-{}", std::process::id()));
+        File::create(&path).unwrap().set_len(32).unwrap();
+        let source = || {
+            let file = File::open(&path).unwrap();
+            Arc::new(Source {
+                // SAFETY: owned test file remains stable until every mapping is dropped.
+                map: unsafe { MmapOptions::new().map(&file) }.unwrap(),
+                file,
+                views: Mutex::new(Vec::new()),
+            })
+        };
+        let first = source();
+        let weak = Arc::downgrade(&first);
+        let lease = |source: &Arc<Source>, offset, len| {
+            ReadOnlyPageBuffer(ReadOnlyStorage::Source {
+                source: Arc::clone(source),
+                offset,
+                len,
+            })
+        };
+        let key = lease(&first, 1, 8).mapping_identity().unwrap();
+        assert!(key.same_backing(&lease(&first, 1, 8).mapping_identity().unwrap()));
+        assert!(!key.same_backing(&lease(&first, 2, 8).mapping_identity().unwrap()));
+        assert!(!key.same_backing(&lease(&first, 1, 7).mapping_identity().unwrap()));
+        drop(first);
+        assert!(weak.upgrade().is_none());
+        let replacement = source();
+        assert!(!key.same_backing(&lease(&replacement, 1, 8).mapping_identity().unwrap()));
+        // SAFETY: same owned stable file; this independent read-only map is dropped before unlink.
+        let view = Arc::new(unsafe { MmapOptions::new().map(&replacement.file) }.unwrap());
+        let weak_view = Arc::downgrade(&view);
+        let mapped = ReadOnlyPageBuffer(ReadOnlyStorage::View(view));
+        let view_key = mapped.mapping_identity().unwrap();
+        assert!(view_key.same_backing(&mapped.mapping_identity().unwrap()));
+        assert!(!view_key.same_backing(&key));
+        drop(mapped);
+        assert!(weak_view.upgrade().is_none());
+        assert!(
+            ReadOnlyPageBuffer(ReadOnlyStorage::Decoded(
+                BufferPool::new().acquire(8).unwrap()
+            ))
+            .mapping_identity()
+            .is_none()
+        );
+        drop(replacement);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn stored_input_views_are_bounded_and_survive_eviction() {
         let path = std::env::temp_dir().join(format!("ehviewer-view-cache-{}", std::process::id()));
         File::create(&path).unwrap().set_len(32 << 20).unwrap();
@@ -747,5 +876,89 @@ mod view_tests {
         drop(source);
         std::fs::remove_file(&path).unwrap();
         assert_eq!(first[0], 0);
+    }
+
+    #[test]
+    fn readonly_large_archive_leases_do_not_pin_evicted_pages_or_the_source() {
+        let directory =
+            std::env::temp_dir().join(format!("ehviewer-readonly-window-{}", std::process::id()));
+        std::fs::create_dir_all(&directory).unwrap();
+        let archive = directory.join("pages.zip");
+        let output = File::create(&archive).unwrap();
+        let mut inputs = (0..12)
+            .map(|index| {
+                use std::io::{Seek, SeekFrom};
+                let path = directory.join(format!("input-{index}"));
+                let mut file = File::create(&path).unwrap();
+                file.set_len(2 << 20).unwrap();
+                file.write_all(&[index]).unwrap();
+                file.seek(SeekFrom::End(-1)).unwrap();
+                file.write_all(&[index + 1]).unwrap();
+                (File::open(path).unwrap(), format!("{index:02}.jpg"))
+            })
+            .collect::<Vec<_>>();
+        use std::os::fd::AsRawFd;
+        write_zip(&mut inputs, output.as_raw_fd()).unwrap();
+        drop(output);
+        let file = File::open(&archive).unwrap();
+        let len = file.metadata().unwrap().len();
+        // SAFETY: this test owns the file; bytes remain unchanged until all mappings are gone.
+        let session = unsafe { ArchiveSession::open(file, len, true, Limits::default()) }.unwrap();
+        assert!(session.source.map.len() > CACHE_BYTES);
+        let source = Arc::downgrade(&session.source);
+        let held = session.extract_readonly(0).unwrap();
+        let address = held.as_slice().as_ptr() as usize;
+        for index in 1..12 {
+            let buffer = session.extract_readonly(index).unwrap();
+            assert!(matches!(buffer.0, ReadOnlyStorage::View(_)));
+            assert_eq!(buffer.as_slice()[0], index as u8);
+            assert_eq!(*buffer.as_slice().last().unwrap(), index as u8 + 1);
+            let views = session.source.views.lock().unwrap();
+            assert!(views.len() <= MAX_PARALLEL);
+            assert!(views.iter().map(|(_, map)| map.len()).sum::<usize>() <= CACHE_BYTES);
+        }
+        // Eviction drops cache ownership, not a live lease. A weak page slot cannot keep an
+        // otherwise unused mapping resident, nor can it create a Source/map reference cycle.
+        assert!(
+            session.pages[1]
+                .readonly
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_none()
+        );
+        assert!(
+            session.pages[0]
+                .readonly
+                .lock()
+                .unwrap()
+                .upgrade()
+                .is_some()
+        );
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let session = &session;
+                scope.spawn(move || {
+                    for _ in 0..100 {
+                        let buffer = session.extract_readonly(0).unwrap();
+                        assert_eq!(buffer.as_slice().as_ptr() as usize, address);
+                        assert_eq!(buffer.as_slice()[0], 0);
+                        assert_eq!(*buffer.as_slice().last().unwrap(), 1);
+                    }
+                });
+            }
+        });
+        let other = session.extract_readonly(0).unwrap();
+        let mut writable = held.into_writable().unwrap();
+        writable.as_mut_slice()[0] = 42;
+        assert_eq!(other.as_slice()[0], 0);
+        let weak_map = session.pages[0].readonly.lock().unwrap().clone();
+        drop(session);
+        assert!(source.upgrade().is_none());
+        std::fs::remove_dir_all(directory).unwrap();
+        assert_eq!(other.as_slice()[0], 0);
+        assert_eq!(writable.as_mut_slice()[0], 42);
+        drop(other);
+        assert!(weak_map.upgrade().is_none());
     }
 }

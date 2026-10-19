@@ -94,6 +94,27 @@ fun nativeArchiveRegression(options: Options): Map<String, Any> {
             executor.shutdownNow()
         }
     }
+    archive(directory.resolve("stored.zip")) {
+        repeat(32) {
+            val first = requireNotNull(extractForReading(0, false))
+            try {
+                first.limit(1).position(1)
+                val second = requireNotNull(extractForReading(0, false))
+                val other = requireNotNull(extractForReading(1, false))
+                try {
+                    check(first !== second && second.isReadOnly)
+                    check(second.position() == 0 && second.limit() == second.capacity())
+                    check(second.get(0) == 'o'.code.toByte() && other.get(0) == 't'.code.toByte())
+                    checks += 3
+                } finally {
+                    releaseByteBuffer(second)
+                    releaseByteBuffer(other)
+                }
+            } finally {
+                releaseByteBuffer(first)
+            }
+        }
+    }
     for (name in listOf("stored.zip", "deflated.zip", "password.zip", "pages.7z", "stored.rar")) {
         archive(directory.resolve(name)) { count ->
             val held = requireNotNull(extractForReading(0, false))

@@ -121,6 +121,11 @@ for a separate diagnostic run (and implies `--samples`). It requires supported,
 enabled JVM thread CPU timing. Combine it with JDK safepoint logging when
 investigating wall-clock outliers. Do not mix instrumented CPU trials into the
 original latency comparison.
+For zero-warmup trials, use phase samples and JIT logs to distinguish native
+extraction from Java page-touch compilation. Faster extraction can change which
+iterations run before the touch loop is optimized, so an end-to-end first-use
+P95 regression alone does not identify a native regression. Keep the original
+unwarmed results; do not hide the tail by adding production warmup or delays.
 The page-touch loop and timed extract/touch/release method are separate from
 optional statistics, so adding diagnostic output does not enlarge their JIT
 compilation bodies. Capture GC counters before allocating output sample lists.

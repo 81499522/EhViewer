@@ -1,5 +1,6 @@
 #![cfg(feature = "jvm")]
 //! Stable Kotlin JNI surface. Sessions and algorithms live in ehviewer_core.
+mod readonly;
 mod registry;
 use super::jvm::{ThrowingHasDefault, jni_throwing};
 use anyhow::{Result, anyhow, ensure};
@@ -10,7 +11,9 @@ use ehviewer_core::{
 };
 use jni::{
     JNIEnv,
-    objects::{GlobalRef, JByteBuffer, JClass, JIntArray, JMethodID, JObjectArray, JString},
+    objects::{
+        GlobalRef, JByteBuffer, JClass, JIntArray, JMethodID, JObject, JObjectArray, JString,
+    },
     signature::ReturnType,
     sys::{jboolean, jint, jlong, jobject},
 };
@@ -45,7 +48,7 @@ struct ReadOnlyMethod {
 static READONLY_METHOD: OnceLock<ReadOnlyMethod> = OnceLock::new();
 fn readonly_view<'local>(
     env: &mut JNIEnv<'local>,
-    direct: &JByteBuffer,
+    direct: &JObject,
 ) -> Result<JByteBuffer<'local>> {
     if READONLY_METHOD.get().is_none() {
         let class = env.find_class("java/nio/ByteBuffer")?;
@@ -58,8 +61,9 @@ fn readonly_view<'local>(
         let _ = READONLY_METHOD.set(method);
     }
     let method = READONLY_METHOD.get().unwrap();
-    // SAFETY: id belongs to the pinned java.nio.ByteBuffer class; direct was just constructed by
-    // NewDirectByteBuffer. The exact no-argument signature returns a ByteBuffer object. JNI errors
+    // SAFETY: id belongs to the pinned java.nio.ByteBuffer class; direct is a JNI-constructed
+    // ByteBuffer or an internal read-only template derived from one. The exact no-argument
+    // signature returns a ByteBuffer object. JNI errors
     // still propagate; only redundant signature parsing/class/method lookup is skipped.
     let object =
         unsafe { env.call_method_unchecked(direct, method.id, ReturnType::Object, &[])? }.l()?;
@@ -81,7 +85,6 @@ fn sentinel<R: ThrowingHasDefault>(f: impl FnOnce() -> Result<R>) -> R {
     }
 }
 fn publish(env: &mut JNIEnv, mut data: BufferData, archive: bool) -> Result<jobject> {
-    let readonly = matches!(data, BufferData::ReadOnly(_));
     let (address, len, retained_bytes) = match &mut data {
         BufferData::Writable(data) => {
             let retained = data.retained_bytes();
@@ -94,16 +97,13 @@ fn publish(env: &mut JNIEnv, mut data: BufferData, archive: bool) -> Result<jobj
             data.retained_bytes(),
         ),
     };
-    // SAFETY: allocation/map has stable address and is retained until explicit release of this
-    // exact Java object. It is independent of SESSION and protected against duplicate releases.
-    let direct = unsafe { env.new_direct_byte_buffer(address, len)? };
-    // JNI has no read-only constructor. The temporary writable Java wrapper is never published
-    // or retained: only asReadOnlyBuffer's result crosses this boundary. Its duplicates/slices
-    // remain read-only, and native writers independently reject readonly registry entries.
-    let object = if readonly {
-        readonly_view(env, &direct)?
-    } else {
-        direct
+    // Allocation/map ownership stays in data until release of this exact Java object, independent
+    // of SESSION. Read-only templates never escape or own native bytes; each lease gets a fresh
+    // real read-only Java object. Native writers also reject read-only registry entries.
+    let object = match &data {
+        BufferData::ReadOnly(data) => readonly::view(env, data)?,
+        // SAFETY: stable allocation/map ownership remains in data until explicit release.
+        BufferData::Writable(_) => unsafe { env.new_direct_byte_buffer(address, len)? },
     };
     let global = env.new_global_ref(&object)?;
     let buffer = Buffer {

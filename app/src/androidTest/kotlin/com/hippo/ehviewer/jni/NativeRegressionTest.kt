@@ -26,6 +26,18 @@ class NativeRegressionTest {
         instrumentation.context.assets.open(name).use { input -> outputStream().use { input.copyTo(it) } }
     }
 
+    private fun archiveMappings(file: File, inode: String): List<Long> {
+        val whitespace = Regex("\\s+")
+        return File("/proc/self/maps").useLines { lines ->
+            // Context paths can use /data/user/0 while the kernel reports /data/data.
+            lines.map { it.trim().split(whitespace, limit = 6) }
+                .filter { it.size == 6 && it[4] == inode && "/${file.name}" in it[5] }.map { fields ->
+                    val (start, end) = fields[0].split('-')
+                    end.toLong(16) - start.toLong(16)
+                }.toList()
+        }
+    }
+
     @Test
     fun hashPreservesCallerDescriptorAndReadsFromOffset() {
         val file = File(context.cacheDir, "native-regression-hash")
@@ -427,6 +439,111 @@ class NativeRegressionTest {
         }
         assertTrue((File("/proc/self/fd").list()?.size ?: 0) <= before + 4)
         file.delete()
+    }
+
+    @Test
+    fun readonlyTemplatesHavePrivateMetadataAndDoNotRetainClosedMappings() {
+        val file = fixture("stored.zip")
+        val inode = java.lang.Long.toUnsignedString(Os.stat(file.absolutePath).st_ino)
+        val buffers = ArrayList<java.nio.ByteBuffer>()
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use {
+                assertEquals(3, openArchive(it.fd, file.length(), true))
+            }
+            val first = requireNotNull(extractForReading(0, false)).also { buffers += it }
+            first.limit(1).position(1)
+            first.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val second = requireNotNull(extractForReading(0, false)).also { buffers += it }
+            val other = requireNotNull(extractForReading(1, false)).also { buffers += it }
+            assertTrue(first !== second && second.isReadOnly)
+            assertEquals(0, second.position())
+            assertEquals(second.capacity(), second.limit())
+            assertEquals(java.nio.ByteOrder.BIG_ENDIAN, second.order())
+            assertEquals('o'.code.toByte(), second.get(0))
+            assertEquals('t'.code.toByte(), other.get(0))
+            closeArchive()
+            assertTrue(file.delete())
+            assertEquals('o'.code.toByte(), second.get(0))
+            assertTrue(archiveMappings(file, inode).isNotEmpty())
+            buffers.forEach(::releaseByteBuffer)
+            buffers.clear()
+            assertTrue(archiveMappings(file, inode).isEmpty())
+        } finally {
+            closeArchive()
+            buffers.forEach(::releaseByteBuffer)
+            file.delete()
+        }
+    }
+
+    @Test
+    fun largeReadonlyViewsSurviveEvictionConcurrencyAndUnlink() {
+        val file = File(context.cacheDir, "native-readonly-windows.zip")
+        val bytes = ByteArray(2 shl 20) { 37 }
+        java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+            repeat(12) { index ->
+                bytes[0] = index.toByte()
+                val checksum = java.util.zip.CRC32().apply { update(bytes) }.value
+                val entry = java.util.zip.ZipEntry("%02d.jpg".format(index)).apply {
+                    method = java.util.zip.ZipEntry.STORED
+                    size = bytes.size.toLong()
+                    compressedSize = size
+                    crc = checksum
+                }
+                zip.putNextEntry(entry)
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+        }
+        val held = ArrayList<java.nio.ByteBuffer>()
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                assertEquals(12, openArchive(fd.fd, file.length(), true))
+            }
+            repeat(64) { held += requireNotNull(extractForReading(0, false)) }
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+            try {
+                val workers = (0..7).map { worker ->
+                    pool.submit {
+                        repeat(24) { iteration ->
+                            val index = (worker + iteration) % 12
+                            val readonly = requireNotNull(extractForReading(index, false))
+                            val writable = requireNotNull(extractToByteBuffer(index))
+                            try {
+                                assertTrue(readonly.isReadOnly)
+                                assertThrows(java.nio.ReadOnlyBufferException::class.java) { readonly.put(0, 1) }
+                                writable.put(0, 99)
+                                assertEquals(index.toByte(), readonly.get(0))
+                                assertEquals(37.toByte(), readonly.get(readonly.capacity() - 1))
+                            } finally {
+                                releaseByteBuffer(writable)
+                                releaseByteBuffer(readonly)
+                                releaseByteBuffer(readonly)
+                            }
+                        }
+                    }
+                }
+                workers.forEach { it.get(60, java.util.concurrent.TimeUnit.SECONDS) }
+            } finally {
+                pool.shutdownNow()
+            }
+            val inode = java.lang.Long.toUnsignedString(Os.stat(file.absolutePath).st_ino)
+            closeArchive()
+            assertTrue(file.delete())
+            held.forEach { assertEquals(0.toByte(), it.get(0)) }
+            // A live page must retain its own mapping, rather than the whole 24-MiB archive.
+            // Allow OS alignment overhead on both 4-KiB and 16-KiB systems.
+            val pageSize = Os.sysconf(OsConstants._SC_PAGESIZE)
+            val mappings = archiveMappings(file, inode)
+            assertTrue(mappings.isNotEmpty())
+            assertTrue(mappings.all { it <= bytes.size + 2 * pageSize })
+            held.forEach(::releaseByteBuffer)
+            held.clear()
+            assertTrue(archiveMappings(file, inode).isEmpty())
+        } finally {
+            closeArchive()
+            held.forEach(::releaseByteBuffer)
+            file.delete()
+        }
     }
 
     @Test
