@@ -28,7 +28,7 @@ first publication, draft retries, lightweight/annotated tags, creation races and
 API failures, and never contact GitHub or publish assets.
 
 ```sh
-tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.9 \
+tools/verification/build/install/verification/bin/verification prepare-release --tag v1.15.10 \
   --sdk "$ANDROID_HOME" --output release-dry-run/apks --private-dir "$PWD/.private-release" --retention-days 180
 tools/verification/build/install/verification/bin/verification device --serial emulator-5560 \
   --sdk "$ANDROID_HOME" --output reports/api26
@@ -121,17 +121,86 @@ for a separate diagnostic run (and implies `--samples`). It requires supported,
 enabled JVM thread CPU timing. Combine it with JDK safepoint logging when
 investigating wall-clock outliers. Do not mix instrumented CPU trials into the
 original latency comparison.
+For zero-warmup trials, use phase samples and JIT logs to distinguish native
+extraction from Java page-touch compilation. Faster extraction can change which
+iterations run before the touch loop is optimized, so an end-to-end first-use
+P95 regression alone does not identify a native regression. Keep the original
+unwarmed results; do not hide the tail by adding production warmup or delays.
 The page-touch loop and timed extract/touch/release method are separate from
 optional statistics, so adding diagnostic output does not enlarge their JIT
 compilation bodies. Capture GC counters before allocating output sample lists.
 Historical measurements still require caution: a fixed 50-operation warmup is
 not proof that JIT compilation, CPU scheduling or the machine has stabilized.
+For microsecond Stored comparisons, inspect JIT compilation separately and use a
+calibrated steady-state cohort (50,000 warmup operations and 10,000 measured
+operations were used for the v1.15.10 single-thread target). Keep shorter,
+first-use and diagnostic cohorts separately labeled; do not silently replace or
+combine their results.
 
 Repeat independent JVM trials for both ZIP inputs, alternating library order.
 `--retained N` measures extraction with other page buffers still outstanding.
 The workload touches each 4-KiB page and releases it; it does not measure Android
 rendering, real-device latency or long-session memory. Keep libraries, generated
 inputs and raw results outside Git.
+
+The same benchmark supports `--readonly` for the new internal reader API (use the
+original writable method for historical C and unmodified Rust). `--threads 1..8`
+creates independent platform workers with private volatile touch counters;
+`--order forward|reverse|random|repeat|legacy` controls navigation with a fixed seed.
+All workers finish warmup before measurement starts. Samples are boxed only after
+every worker stops and GC counters are captured. Reports include P50/P95/P99,
+throughput, open/held-release/close timings and optional original-order samples.
+Repeat all three implementations with the same newly compiled client; older
+measurements from an earlier harness are not interchangeable with a fresh run.
+
+```sh
+tools/verification/build/install/verification/bin/verification native-benchmark-inputs \
+  --output /private/tmp/ehviewer-pages --page-bytes 4194304 --pages 32 --pattern mixed
+JAVA_OPTS='--enable-native-access=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED' \
+  tools/verification/build/install/verification/bin/verification native-benchmark \
+  --library /absolute/path/to/libehviewer_rust.dylib \
+  --archive /private/tmp/ehviewer-pages/large-stored.zip --readonly \
+  --warmup 3000 --loops 2000 --retained 64 --threads 4 --order random --samples
+```
+
+Input generation also accepts 64-KiB/256-KiB/1/4/8/16-MiB pages. `constant` retains
+the original synthetic compressible payload; `mixed` uses seeded random bytes to
+represent already compressed image data. Neither is an Android rendering benchmark.
+Do not request retained-page combinations exceeding the unchanged 128-buffer/512-MiB
+JNI limits. A fresh JVM with `--warmup 0` measures first use of a new mapping and
+unwarmed code, **not a guaranteed cold OS disk cache**.
+
+`--phase-samples` records extraction/JNI, touch and release separately; combine it
+with `--cpu-samples` and JVM safepoint logs for diagnostic trials only. `--pid-file`
+writes the actual JVM PID for stack sampling. `--pause-ms 12000` pauses after the
+measurement while the session/retained leases remain alive for `vmmap`/`footprint`
+inspection. Instrumented/paused trials are marked and excluded from acceptance
+latency cohorts. Capture process CPU/wall/RSS/page faults separately (for example,
+`/usr/bin/time -l` on macOS); whole-JVM RSS includes clean file mappings, JIT and GC.
+Report clean mapped bytes and private/physical footprint separately when explaining
+RSS changes; they do not make an exceeded RSS target a passing result.
+
+The host clients below use the real JNI ABI, retaining fixture data locally:
+
+```sh
+JAVA_OPTS='--enable-native-access=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED' \
+  tools/verification/build/install/verification/bin/verification native-differential \
+  --library /absolute/path/to/libehviewer_rust.dylib --fixtures .local-test-fixtures
+JAVA_OPTS='--enable-native-access=ALL-UNNAMED --add-opens=java.base/java.io=ALL-UNNAMED' \
+  tools/verification/build/install/verification/bin/verification native-regression \
+  --library /absolute/path/to/libehviewer_rust.dylib --fixtures .local-test-fixtures
+```
+
+`native-differential` emits ordered extensions, sizes and SHA-256 for 13 formats and
+checks repeated/backward access using the unchanged C ABI. Compare its JSON across
+the historical C, frozen Rust and optimized Rust libraries; add `--readonly` on the
+optimized library to verify the new reader path against the same oracle.
+`native-regression` is
+Rust-specific: concurrent first-use method caching, true read-only slices/duplicates,
+native write rejection, writable isolation, close survival, stale/double release and
+shared-address registration limits. It never runs the legacy C lifetime hazards.
+Add `--large-archive /path/to/16MiB-pages/large-stored.zip` to verify the independent
+512-MiB byte budget with 32 shared 16-MiB views, below the 128-object count limit.
 
 Regression archives, expected data and licenses are restored into the ignored
 `.local-test-fixtures/` directory from immutable Git baseline

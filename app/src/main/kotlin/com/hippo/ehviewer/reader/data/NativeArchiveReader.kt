@@ -1,7 +1,7 @@
 package com.hippo.ehviewer.reader.data
 
 import com.hippo.ehviewer.jni.closeArchive
-import com.hippo.ehviewer.jni.extractToByteBuffer
+import com.hippo.ehviewer.jni.extractForReading
 import com.hippo.ehviewer.jni.extractToFd
 import com.hippo.ehviewer.jni.getExtension
 import com.hippo.ehviewer.jni.needPassword
@@ -109,7 +109,7 @@ private object JniArchiveBackend : ArchiveBackend {
     override fun needsPassword() = needPassword()
     override fun providePassword(password: String) = com.hippo.ehviewer.jni.providePassword(password)
     override fun extension(index: Int) = getExtension(index)
-    override fun read(index: Int) = extractToByteBuffer(index)
+    override fun read(index: Int) = extractForReading(index, android.os.Build.VERSION.SDK_INT in 28..33)
     override fun copyTo(index: Int, outputFd: Int) = extractToFd(index, outputFd)
     override fun release(buffer: ByteBuffer) = releaseByteBuffer(buffer)
 }

@@ -1,32 +1,74 @@
 #![cfg(feature = "jvm")]
 //! Stable Kotlin JNI surface. Sessions and algorithms live in ehviewer_core.
+mod readonly;
 mod registry;
 use super::jvm::{ThrowingHasDefault, jni_throwing};
 use anyhow::{Result, anyhow, ensure};
 use ehviewer_core::{
-    archive::{ArchiveSession, Limits, PageBuffer, write_zip},
+    archive::{ArchiveSession, Limits, PageBuffer, ReadOnlyPageBuffer, write_zip},
     fd::clone_fd,
     gif, hash,
 };
 use jni::{
     JNIEnv,
-    objects::{GlobalRef, JByteBuffer, JClass, JIntArray, JObjectArray, JString},
+    objects::{
+        GlobalRef, JByteBuffer, JClass, JIntArray, JMethodID, JObject, JObjectArray, JString,
+    },
+    signature::ReturnType,
     sys::{jboolean, jint, jlong, jobject},
 };
 use jni_fn::jni_fn;
 use memmap2::MmapOptions;
 use registry::Registry;
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 static SESSION: Mutex<Option<Arc<ArchiveSession>>> = Mutex::new(None);
 struct Buffer {
     object: GlobalRef,
-    data: Arc<Mutex<PageBuffer>>,
+    data: BufferLease,
     archive: bool,
+}
+enum BufferData {
+    Writable(PageBuffer),
+    ReadOnly(ReadOnlyPageBuffer),
+}
+enum BufferLease {
+    Writable(Arc<Mutex<PageBuffer>>),
+    // Immutable data needs ownership, not a second allocation and a write-serialization mutex.
+    ReadOnly { _data: ReadOnlyPageBuffer },
 }
 const BUFFER_BUDGET: usize = 512 << 20;
 static BUFFERS: Mutex<Registry<Buffer>> = Mutex::new(Registry::new(128, BUFFER_BUDGET));
+struct ReadOnlyMethod {
+    // Pin the declaring class for the complete lifetime of the cached method ID.
+    _class: GlobalRef,
+    id: JMethodID,
+}
+static READONLY_METHOD: OnceLock<ReadOnlyMethod> = OnceLock::new();
+fn readonly_view<'local>(
+    env: &mut JNIEnv<'local>,
+    direct: &JObject,
+) -> Result<JByteBuffer<'local>> {
+    if READONLY_METHOD.get().is_none() {
+        let class = env.find_class("java/nio/ByteBuffer")?;
+        let id = env.get_method_id(&class, "asReadOnlyBuffer", "()Ljava/nio/ByteBuffer;")?;
+        let method = ReadOnlyMethod {
+            _class: env.new_global_ref(class)?,
+            id,
+        };
+        // Concurrent initializers may race; each computes the same method and pins its class.
+        let _ = READONLY_METHOD.set(method);
+    }
+    let method = READONLY_METHOD.get().unwrap();
+    // SAFETY: id belongs to the pinned java.nio.ByteBuffer class; direct is a JNI-constructed
+    // ByteBuffer or an internal read-only template derived from one. The exact no-argument
+    // signature returns a ByteBuffer object. JNI errors
+    // still propagate; only redundant signature parsing/class/method lookup is skipped.
+    let object =
+        unsafe { env.call_method_unchecked(direct, method.id, ReturnType::Object, &[])? }.l()?;
+    Ok(JByteBuffer::from(object))
+}
 fn session() -> Result<Arc<ArchiveSession>> {
     SESSION
         .lock()
@@ -42,17 +84,34 @@ fn sentinel<R: ThrowingHasDefault>(f: impl FnOnce() -> Result<R>) -> R {
         _ => R::default(),
     }
 }
-fn publish(env: &mut JNIEnv, mut data: PageBuffer, archive: bool) -> Result<jobject> {
-    let retained_bytes = data.retained_bytes();
-    let bytes = data.as_mut_slice();
-    let (address, len) = (bytes.as_mut_ptr(), bytes.len());
-    // SAFETY: allocation/map has stable address and is retained until explicit release of this
-    // exact Java object. It is independent of SESSION and protected against duplicate releases.
-    let object = unsafe { env.new_direct_byte_buffer(address, len)? };
+fn publish(env: &mut JNIEnv, mut data: BufferData, archive: bool) -> Result<jobject> {
+    let (address, len, retained_bytes) = match &mut data {
+        BufferData::Writable(data) => {
+            let retained = data.retained_bytes();
+            let bytes = data.as_mut_slice();
+            (bytes.as_mut_ptr(), bytes.len(), retained)
+        }
+        BufferData::ReadOnly(data) => (
+            data.as_slice().as_ptr().cast_mut(),
+            data.as_slice().len(),
+            data.retained_bytes(),
+        ),
+    };
+    // Allocation/map ownership stays in data until release of this exact Java object, independent
+    // of SESSION. Read-only templates never escape or own native bytes; each lease gets a fresh
+    // real read-only Java object. Native writers also reject read-only registry entries.
+    let object = match &data {
+        BufferData::ReadOnly(data) => readonly::view(env, data)?,
+        // SAFETY: stable allocation/map ownership remains in data until explicit release.
+        BufferData::Writable(_) => unsafe { env.new_direct_byte_buffer(address, len)? },
+    };
     let global = env.new_global_ref(&object)?;
     let buffer = Buffer {
         object: global,
-        data: Arc::new(Mutex::new(data)),
+        data: match data {
+            BufferData::Writable(data) => BufferLease::Writable(Arc::new(Mutex::new(data))),
+            BufferData::ReadOnly(data) => BufferLease::ReadOnly { _data: data },
+        },
         archive,
     };
     // JNI allocation and global-reference creation do not hold the registry lock.
@@ -105,11 +164,19 @@ pub fn rewriteGifSource(mut env: JNIEnv, _: JClass, buffer: JByteBuffer) {
         );
         // Retain the containing allocation, including sliced views, then serialize writes to this
         // allocation only. A concurrent release cannot free it or return its storage to the pool.
-        let registered = BUFFERS
-            .lock()
-            .map_err(|_| anyhow!("Buffer lock poisoned"))?
-            .covering(ptr as usize, cap)
-            .map(|b| Arc::clone(&b.data));
+        let registered = {
+            let buffers = BUFFERS
+                .lock()
+                .map_err(|_| anyhow!("Buffer lock poisoned"))?;
+            let entry = buffers.covering(ptr as usize, cap);
+            match entry.map(|b| &b.data) {
+                Some(BufferLease::ReadOnly { .. }) => {
+                    return Err(anyhow!("Read-only native allocation"));
+                }
+                Some(BufferLease::Writable(data)) => Some(Arc::clone(data)),
+                None => None,
+            }
+        };
         let _lease = registered
             .as_ref()
             .map(|data| data.lock().map_err(|_| anyhow!("Buffer lock poisoned")))
@@ -131,7 +198,11 @@ pub fn mmap(mut env: JNIEnv, _: JClass, fd: jint) -> jobject {
         );
         // SAFETY: caller must keep file contents stable while mapped; map_copy never modifies file.
         let map = unsafe { MmapOptions::new().len(size as usize).map_copy(&file)? };
-        publish(&mut env, PageBuffer::Mapped(map), false)
+        publish(
+            &mut env,
+            BufferData::Writable(PageBuffer::Mapped(map)),
+            false,
+        )
     })
 }
 #[jni_fn("com.hippo.ehviewer.jni.GifUtilsKt")]
@@ -182,7 +253,30 @@ pub fn providePassword(mut env: JNIEnv, _: JClass, password: JString) -> jboolea
 pub fn extractToByteBuffer(mut env: JNIEnv, _: JClass, index: jint) -> jobject {
     sentinel(|| {
         ensure!(index >= 0, "Invalid page index");
-        publish(&mut env, session()?.extract(index as usize)?, true)
+        publish(
+            &mut env,
+            BufferData::Writable(session()?.extract(index as usize)?),
+            true,
+        )
+    })
+}
+/// Internal reader API: immutable pages unless the API28-33 GIF workaround needs private writes.
+#[jni_fn("com.hippo.ehviewer.jni.ArchiveKt")]
+pub fn extractForReading(
+    mut env: JNIEnv,
+    _: JClass,
+    index: jint,
+    rewrite_gif: jboolean,
+) -> jobject {
+    sentinel(|| {
+        ensure!(index >= 0, "Invalid page index");
+        let data = session()?.extract_readonly(index as usize)?;
+        let data = if rewrite_gif != 0 && gif::is_gif(data.as_slice()) {
+            BufferData::Writable(data.into_writable()?)
+        } else {
+            BufferData::ReadOnly(data)
+        };
+        publish(&mut env, data, true)
     })
 }
 #[jni_fn("com.hippo.ehviewer.jni.ArchiveKt")]

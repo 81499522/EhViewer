@@ -11,6 +11,7 @@ import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -23,6 +24,18 @@ class NativeRegressionTest {
 
     private fun fixture(name: String): File = File(context.cacheDir, "native-regression-$name").apply {
         instrumentation.context.assets.open(name).use { input -> outputStream().use { input.copyTo(it) } }
+    }
+
+    private fun archiveMappings(file: File, inode: String): List<Long> {
+        val whitespace = Regex("\\s+")
+        return File("/proc/self/maps").useLines { lines ->
+            // Context paths can use /data/user/0 while the kernel reports /data/data.
+            lines.map { it.trim().split(whitespace, limit = 6) }
+                .filter { it.size == 6 && it[4] == inode && "/${file.name}" in it[5] }.map { fields ->
+                    val (start, end) = fields[0].split('-')
+                    end.toLong(16) - start.toLong(16)
+                }.toList()
+        }
     }
 
     @Test
@@ -199,6 +212,110 @@ class NativeRegressionTest {
     }
 
     @Test
+    fun readonlyLeasesRejectWritesAndSurviveCloseUnlinkAndDuplicateRelease() {
+        for (name in listOf("stored.zip", "deflated.zip", "password.zip")) {
+            val file = fixture(name)
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                try {
+                    assertEquals(3, openArchive(fd.fd, file.length(), true))
+                    if (needPassword()) assertTrue(providePassword("baseline"))
+                    val first = requireNotNull(extractForReading(0, false))
+                    val other = requireNotNull(extractForReading(0, false))
+                    assertTrue(first.isDirect && first.isReadOnly)
+                    for (view in listOf(first, first.duplicate(), first.slice())) {
+                        assertTrue(view.isReadOnly)
+                        assertThrows(java.nio.ReadOnlyBufferException::class.java) { view.put(0, 1) }
+                        assertTrue(runCatching { rewriteGifSource(view) }.isFailure)
+                    }
+                    releaseByteBuffer(first.duplicate())
+                    val writable = requireNotNull(extractToByteBuffer(0))
+                    writable.put(0, 'x'.code.toByte())
+                    assertEquals('o'.code.toByte(), first.get(0))
+                    releaseByteBuffer(writable)
+                    releaseByteBuffer(first)
+                    val reused = requireNotNull(extractForReading(0, false))
+                    releaseByteBuffer(first) // Same mapped address, different Java identity.
+                    closeArchive()
+                    file.delete()
+                    assertEquals('o'.code.toByte(), other.get(0))
+                    assertEquals('o'.code.toByte(), reused.get(0))
+                    releaseByteBuffer(other)
+                    releaseByteBuffer(reused)
+                    releaseByteBuffer(reused)
+                } finally {
+                    closeArchive()
+                }
+            }
+            file.delete()
+        }
+    }
+
+    @Test
+    fun sharedReadonlyAddressesStillObeyTheRegistrationLimit() {
+        val file = fixture("stored.zip")
+        val held = mutableListOf<java.nio.ByteBuffer>()
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                assertEquals(3, openArchive(fd.fd, file.length(), true))
+                repeat(128) { held += requireNotNull(extractForReading(0, false)) }
+                assertEquals(null, extractForReading(0, false))
+                val released = held.removeAt(0)
+                releaseByteBuffer(released)
+                held += requireNotNull(extractForReading(0, false))
+                releaseByteBuffer(released)
+                assertEquals(null, extractForReading(0, false))
+                closeArchive()
+                held.forEach { assertEquals('o'.code.toByte(), it.get(0)) }
+            }
+        } finally {
+            held.forEach(::releaseByteBuffer)
+            closeArchive()
+            file.delete()
+        }
+    }
+
+    @Test
+    fun gifWorkaroundUsesContentMagicAndIndependentWritableStorage() {
+        val file = File(context.cacheDir, "native-readonly-gif.zip")
+        val bytes = "GIF89a".toByteArray() + byteArrayOf(0, 0x21, 0xf9.toByte(), 4, 0, 1, 0, 0, 0)
+        for (stored in listOf(true, false)) {
+            java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+                val entry = java.util.zip.ZipEntry("renamed.jpg")
+                if (stored) {
+                    entry.method = java.util.zip.ZipEntry.STORED
+                    entry.size = bytes.size.toLong()
+                    entry.compressedSize = entry.size
+                    entry.crc = java.util.zip.CRC32().apply { update(bytes) }.value
+                }
+                zip.putNextEntry(entry)
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                try {
+                    assertEquals(1, openArchive(fd.fd, file.length(), true))
+                    val readonly = requireNotNull(extractForReading(0, false))
+                    val writable = requireNotNull(extractForReading(0, true))
+                    try {
+                        assertTrue(readonly.isReadOnly)
+                        assertFalse(writable.isReadOnly)
+                        rewriteGifSource(writable)
+                        closeArchive()
+                        assertEquals(10.toByte(), writable.get(11))
+                        assertEquals(1.toByte(), readonly.get(11))
+                    } finally {
+                        releaseByteBuffer(readonly)
+                        releaseByteBuffer(writable)
+                    }
+                } finally {
+                    closeArchive()
+                }
+            }
+        }
+        file.delete()
+    }
+
+    @Test
     fun recycledBuffersAndSlicedGifViewsRemainIndependent() {
         val file = java.io.File(instrumentation.targetContext.cacheDir, "native-reuse.zip")
         val bytes = "xxGIF89a".toByteArray() + byteArrayOf(0, 0x21, 0xf9.toByte(), 4, 0, 1, 0, 0, 0)
@@ -283,7 +400,11 @@ class NativeRegressionTest {
 
     @Test
     fun concurrentReadsAndRepeatedLifetimeDoNotLeakDescriptors() {
-        val file = fixture("deflated.zip")
+        for (name in listOf("stored.zip", "deflated.zip")) checkConcurrentLifetimes(name)
+    }
+
+    private fun checkConcurrentLifetimes(name: String) {
+        val file = fixture(name)
         val before = File("/proc/self/fd").list()?.size ?: 0
         repeat(30) {
             ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
@@ -295,8 +416,9 @@ class NativeRegressionTest {
                             pool.submit {
                                 repeat(20) { n ->
                                     val index = (worker + n) % 3
-                                    val buffer = requireNotNull(extractToByteBuffer(index))
+                                    val buffer = requireNotNull(if (n % 2 == 0) extractForReading(index, false) else extractToByteBuffer(index))
                                     try {
+                                        assertEquals(n % 2 == 0, buffer.isReadOnly)
                                         val bytes = ByteArray(buffer.capacity())
                                         buffer.get(bytes)
                                         assertArrayEquals(listOf("one", "two", "ten")[index].toByteArray(), bytes)
@@ -317,6 +439,111 @@ class NativeRegressionTest {
         }
         assertTrue((File("/proc/self/fd").list()?.size ?: 0) <= before + 4)
         file.delete()
+    }
+
+    @Test
+    fun readonlyTemplatesHavePrivateMetadataAndDoNotRetainClosedMappings() {
+        val file = fixture("stored.zip")
+        val inode = java.lang.Long.toUnsignedString(Os.stat(file.absolutePath).st_ino)
+        val buffers = ArrayList<java.nio.ByteBuffer>()
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use {
+                assertEquals(3, openArchive(it.fd, file.length(), true))
+            }
+            val first = requireNotNull(extractForReading(0, false)).also { buffers += it }
+            first.limit(1).position(1)
+            first.order(java.nio.ByteOrder.LITTLE_ENDIAN)
+            val second = requireNotNull(extractForReading(0, false)).also { buffers += it }
+            val other = requireNotNull(extractForReading(1, false)).also { buffers += it }
+            assertTrue(first !== second && second.isReadOnly)
+            assertEquals(0, second.position())
+            assertEquals(second.capacity(), second.limit())
+            assertEquals(java.nio.ByteOrder.BIG_ENDIAN, second.order())
+            assertEquals('o'.code.toByte(), second.get(0))
+            assertEquals('t'.code.toByte(), other.get(0))
+            closeArchive()
+            assertTrue(file.delete())
+            assertEquals('o'.code.toByte(), second.get(0))
+            assertTrue(archiveMappings(file, inode).isNotEmpty())
+            buffers.forEach(::releaseByteBuffer)
+            buffers.clear()
+            assertTrue(archiveMappings(file, inode).isEmpty())
+        } finally {
+            closeArchive()
+            buffers.forEach(::releaseByteBuffer)
+            file.delete()
+        }
+    }
+
+    @Test
+    fun largeReadonlyViewsSurviveEvictionConcurrencyAndUnlink() {
+        val file = File(context.cacheDir, "native-readonly-windows.zip")
+        val bytes = ByteArray(2 shl 20) { 37 }
+        java.util.zip.ZipOutputStream(file.outputStream()).use { zip ->
+            repeat(12) { index ->
+                bytes[0] = index.toByte()
+                val checksum = java.util.zip.CRC32().apply { update(bytes) }.value
+                val entry = java.util.zip.ZipEntry("%02d.jpg".format(index)).apply {
+                    method = java.util.zip.ZipEntry.STORED
+                    size = bytes.size.toLong()
+                    compressedSize = size
+                    crc = checksum
+                }
+                zip.putNextEntry(entry)
+                zip.write(bytes)
+                zip.closeEntry()
+            }
+        }
+        val held = ArrayList<java.nio.ByteBuffer>()
+        try {
+            ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY).use { fd ->
+                assertEquals(12, openArchive(fd.fd, file.length(), true))
+            }
+            repeat(64) { held += requireNotNull(extractForReading(0, false)) }
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(8)
+            try {
+                val workers = (0..7).map { worker ->
+                    pool.submit {
+                        repeat(24) { iteration ->
+                            val index = (worker + iteration) % 12
+                            val readonly = requireNotNull(extractForReading(index, false))
+                            val writable = requireNotNull(extractToByteBuffer(index))
+                            try {
+                                assertTrue(readonly.isReadOnly)
+                                assertThrows(java.nio.ReadOnlyBufferException::class.java) { readonly.put(0, 1) }
+                                writable.put(0, 99)
+                                assertEquals(index.toByte(), readonly.get(0))
+                                assertEquals(37.toByte(), readonly.get(readonly.capacity() - 1))
+                            } finally {
+                                releaseByteBuffer(writable)
+                                releaseByteBuffer(readonly)
+                                releaseByteBuffer(readonly)
+                            }
+                        }
+                    }
+                }
+                workers.forEach { it.get(60, java.util.concurrent.TimeUnit.SECONDS) }
+            } finally {
+                pool.shutdownNow()
+            }
+            val inode = java.lang.Long.toUnsignedString(Os.stat(file.absolutePath).st_ino)
+            closeArchive()
+            assertTrue(file.delete())
+            held.forEach { assertEquals(0.toByte(), it.get(0)) }
+            // A live page must retain its own mapping, rather than the whole 24-MiB archive.
+            // Allow OS alignment overhead on both 4-KiB and 16-KiB systems.
+            val pageSize = Os.sysconf(OsConstants._SC_PAGESIZE)
+            val mappings = archiveMappings(file, inode)
+            assertTrue(mappings.isNotEmpty())
+            assertTrue(mappings.all { it <= bytes.size + 2 * pageSize })
+            held.forEach(::releaseByteBuffer)
+            held.clear()
+            assertTrue(archiveMappings(file, inode).isEmpty())
+        } finally {
+            closeArchive()
+            held.forEach(::releaseByteBuffer)
+            file.delete()
+        }
     }
 
     @Test

@@ -11,5 +11,6 @@ interface ArchiveReader : ArchiveCatalog, AutoCloseable {
 
 /** The original direct buffer remains owned until this page is closed. */
 interface ArchivePage : AutoCloseable {
+    /** Valid until close. Treat content as immutable; the backend owns decoder write workarounds. */
     val buffer: ByteBuffer
 }

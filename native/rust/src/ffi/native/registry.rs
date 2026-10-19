@@ -55,7 +55,9 @@ impl<T> Registry<T> {
             return Ok(None);
         };
         let mut found = None;
-        for (index, entry) in bucket.iter().enumerate() {
+        // Read-only leases may share a mapped address. The newest extraction is usually released
+        // first during reading; check it first without weakening exact Java-object validation.
+        for (index, entry) in bucket.iter().enumerate().rev() {
             if matches(&entry.value)? {
                 found = Some(index);
                 break;
@@ -132,5 +134,27 @@ mod tests {
         registry.remove(100, |_| Ok(true)).unwrap();
         assert_eq!((registry.count, registry.bytes), (0, 0));
         registry.insert(200, 1, 16, 2).unwrap();
+    }
+
+    #[test]
+    fn overlapping_readonly_identities_use_the_recent_lease_fast_path() {
+        let mut registry = Registry::new(128, 1024);
+        for identity in 0..65 {
+            registry.insert(100, 8, 8, identity).unwrap();
+        }
+        let mut comparisons = 0;
+        assert_eq!(
+            registry
+                .remove(100, |id| {
+                    comparisons += 1;
+                    Ok(*id == 64)
+                })
+                .unwrap(),
+            Some(64)
+        );
+        assert_eq!(comparisons, 1);
+        assert_eq!(registry.remove(100, |id| Ok(*id == 0)).unwrap(), Some(0));
+        assert_eq!(registry.remove(100, |id| Ok(*id == 64)).unwrap(), None);
+        assert_eq!((registry.count, registry.bytes), (63, 63 * 8));
     }
 }
