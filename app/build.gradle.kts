@@ -177,7 +177,6 @@ android {
             isShrinkResources = true
             proguardFiles("proguard-rules.pro")
             signingConfig = signConfig
-            if (coexist) resValue("string", "app_name", "EhViewer 共存")
         }
         debug {
             applicationIdSuffix = ".debug"
@@ -189,6 +188,10 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             isDebuggable = false
         }
+    }
+
+    if (coexist) {
+        sourceSets.getByName("release").res.srcDir("src/coexist/res")
     }
 
     buildFeatures {
