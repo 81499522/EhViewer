@@ -15,6 +15,7 @@
   ~ You should have received a copy of the GNU General Public License along with EhViewer.
   ~ If not, see <https://www.gnu.org/licenses/>.
   -->
+<!-- targetPackage is rewritten to the variant applicationId when resources are generated. -->
 <shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
 
     <shortcut
