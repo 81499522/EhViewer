@@ -42,7 +42,7 @@ androidComponents {
     onVariants(selector().all()) { variant ->
         variant.androidTest?.sources?.assets?.addGeneratedSourceDirectory(prepareNativeTestFixtures) { it.outputDirectory }
         val generateShortcutResources = tasks.register<GenerateShortcutResourcesTask>("generate${variant.name.replaceFirstChar { it.uppercase() }}ShortcutResources") {
-            template.set(layout.projectDirectory.file("src/main/res/xml/shortcuts.xml"))
+            template.set(layout.projectDirectory.file("src/main/shortcut-template/shortcuts.xml"))
             applicationId.set(variant.applicationId)
             outputDirectory.set(layout.buildDirectory.dir("generated/shortcutRes/${variant.name}"))
         }
@@ -58,11 +58,6 @@ android {
             include(*buildAbis)
             isUniversalApk = releaseAbi == null
         }
-    }
-
-    sourceSets.named("main") {
-        // Packaged copy is generated per variant so targetPackage matches applicationId.
-        res.exclude("xml/shortcuts.xml")
     }
 
     val signingProperties = Properties().apply {
