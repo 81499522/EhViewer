@@ -81,7 +81,7 @@ android {
     defaultConfig {
         applicationId = "moe.tarsin.ehviewer"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 180074
+        versionCode = 180074082
         versionName = if (snapshot) {
             "$releaseVersion-SNAPSHOT"
         } else {
