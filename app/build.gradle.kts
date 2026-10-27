@@ -2,6 +2,14 @@ import com.mikepenz.aboutlibraries.plugin.DuplicateMode
 import com.mikepenz.aboutlibraries.plugin.DuplicateRule
 import java.util.Properties
 import java.util.regex.Pattern
+import org.gradle.api.DefaultTask
+import org.gradle.api.file.DirectoryProperty
+import org.gradle.api.file.RegularFileProperty
+import org.gradle.api.provider.Property
+import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFile
+import org.gradle.api.tasks.OutputDirectory
+import org.gradle.api.tasks.TaskAction
 
 plugins {
     alias(libs.plugins.ehviewer.android.application)
@@ -13,6 +21,9 @@ plugins {
 }
 
 val releaseVersion = "1.15.10"
+
+// -Pcoexist=true installs beside moe.tarsin.ehviewer. The default release id stays unchanged.
+val coexist = providers.gradleProperty("coexist").orNull?.toBoolean() == true
 
 val supportedAbis = arrayOf("arm64-v8a", "x86_64", "armeabi-v7a")
 val releaseAbi = providers.gradleProperty("releaseAbi").orNull
@@ -30,6 +41,12 @@ val prepareNativeTestFixtures = tasks.register<NativeTestFixturesTask>("prepareN
 androidComponents {
     onVariants(selector().all()) { variant ->
         variant.androidTest?.sources?.assets?.addGeneratedSourceDirectory(prepareNativeTestFixtures) { it.outputDirectory }
+        val generateShortcutResources = tasks.register<GenerateShortcutResourcesTask>("generate${variant.name.replaceFirstChar { it.uppercase() }}ShortcutResources") {
+            template.set(layout.projectDirectory.file("src/main/shortcut-template/shortcuts.xml"))
+            applicationId.set(variant.applicationId)
+            outputDirectory.set(layout.buildDirectory.dir("generated/shortcutRes/${variant.name}"))
+        }
+        variant.sources.res?.addGeneratedSourceDirectory(generateShortcutResources) { it.outputDirectory }
     }
 }
 
@@ -80,12 +97,12 @@ android {
 
     defaultConfig {
         applicationId = "moe.tarsin.ehviewer"
+        if (coexist) applicationIdSuffix = ".coexist"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-        versionCode = 180074
-        versionName = if (snapshot) {
-            "$releaseVersion-SNAPSHOT"
-        } else {
-            releaseVersion
+        versionCode = 180074082
+        versionName = buildString {
+            append(if (snapshot) "$releaseVersion-SNAPSHOT" else releaseVersion)
+            if (coexist) append("-coexist")
         }
         buildConfigField("boolean", "SNAPSHOT", "$snapshot")
         buildConfigField("String", "RAW_VERSION_NAME", "\"$versionName\"")
@@ -171,6 +188,10 @@ android {
             signingConfig = signingConfigs.getByName("debug")
             isDebuggable = false
         }
+    }
+
+    if (coexist) {
+        sourceSets.getByName("release").res.srcDir("src/coexist/res")
     }
 
     buildFeatures {
@@ -292,5 +313,25 @@ aboutLibraries {
         exclusionPatterns.add(Pattern.compile("org\\.jetbrains\\.(?:compose|androidx)\\..*"))
         duplicationMode = DuplicateMode.MERGE
         duplicationRule = DuplicateRule.GROUP
+    }
+}
+
+abstract class GenerateShortcutResourcesTask : DefaultTask() {
+    @get:InputFile abstract val template: RegularFileProperty
+
+    @get:Input abstract val applicationId: Property<String>
+
+    @get:OutputDirectory abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun generate() {
+        val root = outputDirectory.get().asFile
+        val destination = root.resolve("xml/shortcuts.xml")
+        destination.parentFile.mkdirs()
+        val source = template.get().asFile.readText()
+        val needle = "android:targetPackage=\"moe.tarsin.ehviewer\""
+        val replacements = source.split(needle).size - 1
+        check(replacements == 2) { "Expected 2 shortcut targets, found $replacements" }
+        destination.writeText(source.replace(needle, "android:targetPackage=\"${applicationId.get()}\""))
     }
 }
