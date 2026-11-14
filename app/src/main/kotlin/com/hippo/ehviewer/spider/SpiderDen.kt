@@ -16,10 +16,8 @@
 package com.hippo.ehviewer.spider
 
 import android.webkit.MimeTypeMap
-import arrow.fx.coroutines.autoCloseable
-import arrow.fx.coroutines.closeable
 import arrow.fx.coroutines.parMap
-import arrow.fx.coroutines.resourceScope
+import com.ehviewer.core.data.model.toEntitySnapshot
 import com.ehviewer.core.database.model.DownloadArtist
 import com.ehviewer.core.files.delete
 import com.ehviewer.core.files.exists
@@ -29,7 +27,9 @@ import com.ehviewer.core.files.list
 import com.ehviewer.core.files.mkdirs
 import com.ehviewer.core.files.moveTo
 import com.ehviewer.core.files.openFileDescriptor
+import com.ehviewer.core.files.openInputStream
 import com.ehviewer.core.files.sendTo
+import com.ehviewer.core.files.write
 import com.ehviewer.core.model.GalleryDetail
 import com.ehviewer.core.model.GalleryInfo
 import com.ehviewer.core.util.logcat
@@ -45,17 +45,24 @@ import com.hippo.ehviewer.download.DownloadManager
 import com.hippo.ehviewer.download.downloadLocation
 import com.hippo.ehviewer.download.tempDownloadDir
 import com.hippo.ehviewer.image.PathSource
-import com.hippo.ehviewer.jni.archiveFdBatch
+import com.hippo.ehviewer.jni.appendZipEntry
+import com.hippo.ehviewer.jni.beginZipWriter
+import com.hippo.ehviewer.jni.closeZipWriter
 import com.hippo.ehviewer.ktbuilder.diskCache
+import com.hippo.ehviewer.ktor.allowReadTransportRetry
 import com.hippo.ehviewer.util.FileUtils
 import com.hippo.ehviewer.util.copyTo
-import com.hippo.ehviewer.util.sha1
+import com.hippo.ehviewer.util.copyWithSha1
 import io.ktor.client.statement.HttpResponse
 import io.ktor.client.statement.bodyAsChannel
 import io.ktor.client.statement.request
+import java.io.File
 import java.util.concurrent.locks.ReentrantReadWriteLock
 import kotlin.concurrent.read
 import kotlin.concurrent.write
+import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.ensureActive
+import moe.tarsin.coroutines.runSuspendCatching
 import okio.Path
 import okio.Path.Companion.toOkioPath
 import splitties.init.appCtx
@@ -68,12 +75,16 @@ class SpiderDen(val info: GalleryInfo) {
     private var tempDownloadDir: Path? = null
     private val saveAsCbz = Settings.saveAsCbz.value
     private val archiveName = "$gid.cbz"
+    val archivesDownload get() = saveAsCbz
+    private var archivedSources: List<Path>? = null
 
     private val lock = ReentrantReadWriteLock()
 
-    // Search in both directories to maintain compatibility
-    private val fileCache by lazy {
-        listOfNotNull(tempDownloadDir, downloadDir).map(Path::list).flatten().associateBy { it.name } as MutableMap
+    private val fileIndex = PageFileIndex()
+
+    private fun refreshFileIndex() = lock.write {
+        // Search both directories to support galleries downloaded by older versions.
+        fileIndex.refresh(sequenceOf(tempDownloadDir, downloadDir).filterNotNull().distinct().flatMap { it.list().asSequence() })
     }
 
     private val imageDir
@@ -81,6 +92,8 @@ class SpiderDen(val info: GalleryInfo) {
 
     constructor(info: GalleryInfo, dirname: String) : this(info) {
         downloadDir = downloadLocation / dirname
+        tempDownloadDir = info.tempDownloadDir?.takeIf { it.isDirectory }
+        refreshFileIndex()
     }
 
     @Volatile
@@ -89,15 +102,17 @@ class SpiderDen(val info: GalleryInfo) {
         private set
 
     suspend fun setMode(value: Int) {
-        mode = value
-        if (mode == SpiderQueen.MODE_DOWNLOAD) {
+        if (value == SpiderQueen.MODE_DOWNLOAD) {
+            val refresh = downloadDir == null || (saveAsCbz && tempDownloadDir == null)
             if (downloadDir == null) {
                 downloadDir = getGalleryDownloadDir(info).apply { mkdirs() }
             }
             if (saveAsCbz && tempDownloadDir == null) {
-                tempDownloadDir = info.tempDownloadDir!!.apply { mkdirs() }
+                tempDownloadDir = info.tempDownloadDir?.apply { mkdirs() }
             }
+            if (refresh) refreshFileIndex()
         }
+        mode = value
     }
 
     private fun containInCache(index: Int): Boolean {
@@ -105,9 +120,13 @@ class SpiderDen(val info: GalleryInfo) {
         return sCache.read(key) {} != null
     }
 
-    private fun findImageFile(index: Int, temp: Boolean = false) = lock.read {
-        val head = perFilename(index)
-        fileCache.entries.firstOrNull { (name) -> name.startsWith(head) && temp == name.endsWith(TEMP_SUFFIX) }?.value
+    private fun findImageFile(index: Int): Path? {
+        val candidates = lock.read { fileIndex.candidates(index, temporary = false) }
+        for (file in candidates) {
+            if (file.exists()) return file
+            lock.write { if (!file.exists()) fileIndex.remove(file) }
+        }
+        return null
     }
 
     private fun containInDownloadDir(index: Int): Boolean = findImageFile(index) != null
@@ -118,8 +137,16 @@ class SpiderDen(val info: GalleryInfo) {
         return runCatching {
             sCache.read(key) {
                 val extension = metadata.toFile().readText()
-                val file = dir.findDownloadFileForIndex(index, extension)
-                data sendTo file
+                val file = dir.resolve(perFilename(index, extension))
+                val temporary = dir.resolve(file.name + TEMP_SUFFIX)
+                lock.write { fileIndex.add(temporary) }
+                try {
+                    data sendTo temporary
+                    commitImage(temporary, file)
+                } finally {
+                    temporary.delete()
+                    lock.write { fileIndex.remove(temporary) }
+                }
             } != null
         }.onFailure {
             logcat(it)
@@ -143,9 +170,11 @@ class SpiderDen(val info: GalleryInfo) {
         return sCache.remove(key)
     }
 
-    private fun removeTempFile(index: Int) = findImageFile(index, temp = true)?.let { file ->
-        file.delete()
-        lock.write { fileCache.remove(file.name) }
+    private fun removeTempFile(index: Int) {
+        lock.read { fileIndex.candidates(index, temporary = true) }.forEach { file ->
+            file.delete()
+            lock.write { fileIndex.remove(file) }
+        }
     }
 
     fun removeIntermediateFiles(index: Int) {
@@ -157,9 +186,14 @@ class SpiderDen(val info: GalleryInfo) {
         repeat(info.pages, ::removeFromCache)
     }
 
-    private fun Path.findDownloadFileForIndex(index: Int, extension: String) = with(lock) {
-        val name = perFilename(index, extension)
-        read { fileCache[name] } ?: resolve(name).also { write { fileCache[name] = it } }
+    private fun commitImage(temporary: Path, file: Path) {
+        if (!file.isAbsolute) {
+            file.delete()
+            lock.write { fileIndex.remove(file) }
+        }
+        temporary moveTo file
+        check(file.exists()) { "Unable to commit ${file.name}" }
+        lock.write { fileIndex.add(file) }
     }
 
     suspend fun makeHttpCallAndSaveImage(
@@ -169,7 +203,12 @@ class SpiderDen(val info: GalleryInfo) {
         notifyProgress: (Long, Long, Int) -> Unit,
     ) = timeoutBySpeed(
         url,
-        { ehRequest(url, referer, builder = it) },
+        { configure ->
+            ehRequest(url, referer) {
+                allowReadTransportRetry()
+                configure()
+            }
+        },
         notifyProgress,
         { resp -> check(saveFromHttpResponse(index, resp)) },
     )
@@ -180,15 +219,16 @@ class SpiderDen(val info: GalleryInfo) {
         crossinline fops: suspend (Path) -> Unit,
     ): Boolean {
         imageDir?.run {
-            val tempFile = findDownloadFileForIndex(index, "$ext$TEMP_SUFFIX")
-            fops(tempFile)
-            val file = resolve(tempFile.name.removeSuffix(TEMP_SUFFIX))
-            file.delete()
-            lock.write { fileCache.remove(file.name) }
-            tempFile moveTo file
-            lock.write {
-                fileCache.remove(tempFile.name)
-                fileCache[file.name] = file
+            val file = resolve(perFilename(index, ext))
+            val tempFile = resolve(file.name + TEMP_SUFFIX)
+            lock.write { fileIndex.add(tempFile) }
+            try {
+                fops(tempFile)
+                coroutineContext.ensureActive()
+                commitImage(tempFile, file)
+            } finally {
+                tempFile.delete()
+                lock.write { fileIndex.remove(tempFile) }
             }
             return true
         }
@@ -208,10 +248,12 @@ class SpiderDen(val info: GalleryInfo) {
         val url = response.request.url.toString()
         val extension = MimeTypeMap.getFileExtensionFromUrl(url).ifEmpty { "jpg" }
         return saveResponseMeta(index, extension) { outFile ->
-            response.bodyAsChannel().copyTo(outFile)
-            FileHashRegex.find(url)?.let {
-                val expected = it.groupValues[1]
-                val actual = outFile.sha1()
+            val body = response.bodyAsChannel()
+            val expected = FileHashRegex.find(url)?.groupValues?.get(1)
+            if (expected == null) {
+                body.copyTo(outFile)
+            } else {
+                val actual = outFile.write { body.copyWithSha1(this) }
                 check(expected == actual) { "File hash mismatch: expected $expected, but got $actual\nURL: $url" }
             }
         }
@@ -273,61 +315,127 @@ class SpiderDen(val info: GalleryInfo) {
         }
     }
 
-    suspend fun archive() = saveAsCbz && downloadDir?.run {
-        resolve(archiveName).let { file ->
-            runCatching {
-                archiveTo(file)
-            }.onFailure {
-                file.delete()
-                logcat(it)
-            }.isFailure
-        }
-    } == true
-
-    // Postpone this to `SpiderQueen.stop` because files may still be in use by reader
-    suspend fun postArchive(): Boolean {
-        val dir = downloadDir
-        val archived = saveAsCbz && dir?.find(archiveName) != null
-        if (archived) {
-            dir.list().parMap(concurrency = 10) {
-                if (it.name.matches(FileNameRegex)) {
-                    it.delete()
-                }
+    suspend fun archive(pages: Int): Boolean {
+        if (!saveAsCbz) return true
+        var stage = "write"
+        return runSuspendCatching {
+            val target = checkNotNull(downloadDir) / archiveName
+            val sources = archiveSources(pages)
+            CbzCommit(target).write(pages, onStage = { stage = it }) { staged ->
+                buildCbz(staged, sources, refreshMetadata = true)
             }
-            (dir / SpiderQueen.SPIDER_INFO_FILENAME).delete()
-            tempDownloadDir?.delete()
-        }
-        return archived
+            archivedSources = sources
+        }.onFailure { failure ->
+            logcat("SpiderDen") { "CBZ $stage failed (${failure.javaClass.simpleName})" }
+        }.isSuccess
     }
 
-    suspend fun exportAsCbz(file: Path) = downloadDir!!.find(archiveName)?.sendTo(file) ?: archiveTo(file)
+    suspend fun recoverArchive(pages: Int): Boolean {
+        val target = downloadDir?.resolve(archiveName) ?: return false
+        return runSuspendCatching {
+            CbzCommit(target).recover(pages)
+        }.onFailure { logcat("SpiderDen") { "CBZ recovery failed (${it.javaClass.simpleName})" } }.getOrDefault(false)
+    }
 
-    private suspend fun archiveTo(file: Path) = resourceScope {
-        val comicInfo = closeable {
-            val f = downloadDir!! / COMIC_INFO_FILE
-            if (!f.exists()) {
-                writeComicInfo()
-            } else if (info.pages == 0) {
-                info.pages = readComicInfo(f)!!.pageCount
-            }
-            f.openFileDescriptor("r")
+    // Postpone source cleanup until the last reader releases this gallery.
+    suspend fun postArchive(): Boolean {
+        val sources = archivedSources ?: return false
+        val cleanup = runSuspendCatching {
+            sources.parMap(concurrency = 10) { it.delete() }
+            refreshFileIndex()
         }
-        val pages = info.pages
-        val (fdBatch, names) = (0 until pages).parMap { idx ->
-            val f = autoCloseable { getImageSource(idx) }
-            closeable { f.source.openFileDescriptor("r") }.fd to perFilename(idx, f.type)
-        }.run { plus(comicInfo.fd to COMIC_INFO_FILE) }.unzip()
-        val arcFd = closeable { file.openFileDescriptor("rw") }
-        archiveFdBatch(fdBatch.toIntArray(), names.toTypedArray(), arcFd.fd, pages + 1)
+        cleanup.onFailure { logcat("SpiderDen") { "CBZ source cleanup failed (${it.javaClass.simpleName})" } }
+        return true
+    }
+
+    suspend fun exportAsCbz(file: Path) {
+        val directory = checkNotNull(downloadDir)
+        val existing = directory / archiveName
+        check(!existing.isSameCbzDocument(file)) { "CBZ export destination is the source" }
+        withCbzTemp { staged ->
+            if (existing.exists() && !existing.cbzSidecar(".pending").exists()) {
+                existing.openInputStream().use { source -> staged.outputStream().use { copyCbz(source, it) } }
+                verifyCbz(staged, expectedPages = null, COMIC_INFO_FILE)
+            } else {
+                val pages = info.pages.takeIf { it > 0 } ?: readComicInfo(directory / COMIC_INFO_FILE)?.pageCount ?: 0
+                val extra = lock.read { fileIndex.finalPathsFrom(pages) }
+                check(extra.none { it.exists() }) { "CBZ export has source pages beyond the recorded page count" }
+                val sources = archiveSources(pages)
+                check(sources.none { it.isSameCbzDocument(file) }) { "CBZ export destination is a source page" }
+                buildCbz(staged, sources, refreshMetadata = false)
+                verifyCbz(staged, pages, COMIC_INFO_FILE)
+            }
+            val fingerprint = staged.inputStream().use { copyCbz(it) }
+            copyVerifiedCbz(staged, file, create = false, fingerprint = fingerprint)
+        }
+    }
+
+    private fun archiveSources(pages: Int): List<Path> {
+        check(pages > 0) { "Unknown CBZ page count" }
+        return List(pages) { index ->
+            checkNotNull(findImageFile(index)) { "Missing CBZ source page ${index + 1}" }
+        }
+    }
+
+    private suspend fun buildCbz(file: File, sources: List<Path>, refreshMetadata: Boolean) {
+        val directory = checkNotNull(downloadDir)
+        val existingMetadata = readComicInfo(directory / COMIC_INFO_FILE)
+        val metadata = (
+            existingMetadata ?: run {
+                val metadataInfo = if (refreshMetadata && info !is GalleryDetail) {
+                    info.toEntitySnapshot().also { snapshot ->
+                        runSuspendCatching { EhEngine.fillGalleryListByApi(listOf(snapshot)) }
+                            .onFailure { logcat("SpiderDen") { "CBZ metadata refresh failed (${it.javaClass.simpleName})" } }
+                    }
+                } else {
+                    info
+                }
+                metadataInfo.getComicInfo()
+            }
+            ).copy(pageCount = sources.size)
+        withCbzTemp { comicInfo ->
+            writeComicInfo(metadata, comicInfo.toOkioPath())
+            file.toOkioPath().openFileDescriptor("rwt").use { output ->
+                val handle = beginZipWriter(output.fd)
+                try {
+                    sources.forEachIndexed { index, image ->
+                        coroutineContext.ensureActive()
+                        val extension = checkNotNull(FileUtils.getExtensionFromFilename(image.name))
+                        val name = perFilename(index, extension)
+                        if (image.isAbsolute) {
+                            image.openFileDescriptor("r").use { appendZipEntry(handle, it.fd, name) }
+                        } else {
+                            // A provider may return a pipe. Stage at most one page for the ZIP writer.
+                            withCbzTemp { page ->
+                                image.openInputStream().use { input -> page.outputStream().use { copyCbz(input, it) } }
+                                page.toOkioPath().openFileDescriptor("r").use { appendZipEntry(handle, it.fd, name) }
+                            }
+                        }
+                    }
+                    comicInfo.toOkioPath().openFileDescriptor("r").use { appendZipEntry(handle, it.fd, COMIC_INFO_FILE) }
+                    closeZipWriter(handle, true)
+                } finally {
+                    closeZipWriter(handle, false)
+                }
+            }
+        }
+        if (refreshMetadata) {
+            runSuspendCatching {
+                writeComicInfo(metadata, directory / COMIC_INFO_FILE)
+                saveDownloadArtists(metadata)
+            }.onFailure { logcat("SpiderDen") { "Unable to update local CBZ metadata (${it.javaClass.simpleName})" } }
+        }
     }
 
     suspend fun initDownloadDirIfExist() {
         downloadDir = getGalleryDownloadDir(info).takeIf { it.isDirectory }
         tempDownloadDir = info.tempDownloadDir?.takeIf { it.isDirectory }
+        refreshFileIndex()
     }
 
     suspend fun initDownloadDir() {
         downloadDir = getGalleryDownloadDir(info).apply { mkdirs() }
+        refreshFileIndex()
     }
 
     suspend fun writeComicInfo(fetchMetadata: Boolean = true) {
@@ -338,12 +446,16 @@ class SpiderDen(val info: GalleryInfo) {
                 }
                 info.getComicInfo().apply {
                     writeComicInfo(this, it)
-                    DownloadManager.getDownloadInfo(gid)?.let { downloadInfo ->
-                        downloadInfo.artistInfoList = DownloadArtist.from(gid, penciller.orEmpty())
-                        EhDB.putDownloadArtist(gid, downloadInfo.artistInfoList)
-                    }
+                    saveDownloadArtists(this)
                 }
             }
+        }
+    }
+
+    private suspend fun saveDownloadArtists(metadata: ComicInfo) {
+        DownloadManager.getDownloadInfo(gid)?.let { downloadInfo ->
+            downloadInfo.artistInfoList = DownloadArtist.from(gid, metadata.penciller.orEmpty())
+            EhDB.putDownloadArtist(gid, downloadInfo.artistInfoList)
         }
     }
 }
@@ -354,7 +466,7 @@ private val sCache by lazy {
         maxSizeBytes(Settings.readCacheSize.value.coerceIn(320, 5120).toLong() * 1024 * 1024)
     }
 }
-private const val TEMP_SUFFIX = ".tmp"
+internal const val TEMP_SUFFIX = ".tmp"
 private val FileNameRegex = Regex("^\\d{8}\\.\\w{3,4}")
 private val FileHashRegex = Regex("/h/([0-9a-f]{40})")
 

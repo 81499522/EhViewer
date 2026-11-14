@@ -16,6 +16,7 @@
 package com.hippo.ehviewer
 
 import androidx.room.execSQL
+import androidx.room.immediateTransaction
 import androidx.room.useWriterConnection
 import arrow.fx.coroutines.resource
 import arrow.fx.coroutines.resourceScope
@@ -25,6 +26,7 @@ import com.ehviewer.core.database.Schema17to18
 import com.ehviewer.core.database.getDatabasePath
 import com.ehviewer.core.database.model.DownloadArtist
 import com.ehviewer.core.database.model.DownloadDirname
+import com.ehviewer.core.database.model.DownloadEntity
 import com.ehviewer.core.database.model.DownloadInfo
 import com.ehviewer.core.database.model.DownloadLabel
 import com.ehviewer.core.database.model.Filter
@@ -59,6 +61,8 @@ object EhDB {
         db.galleryDao().update(galleryInfoList)
     }
 
+    suspend fun updateGalleryPageCount(gid: Long, pages: Int) = db.galleryDao().updatePageCount(gid, pages)
+
     fun getReadProgressFlow(gid: Long) = db.progressDao().getPageFlow(gid)
     suspend fun getReadProgress(gid: Long) = db.progressDao().getPage(gid)
     suspend fun putReadProgress(gid: Long, page: Int) = db.progressDao().upsert(ProgressInfo(gid, page))
@@ -75,10 +79,16 @@ object EhDB {
         dao.update(downloadInfo.map(DownloadInfo::downloadInfo))
     }
 
+    suspend fun updateDownloadStates(downloads: List<DownloadEntity>) {
+        if (downloads.isNotEmpty()) db.downloadsDao().update(downloads)
+    }
+
     suspend fun putDownloadInfo(downloadInfo: DownloadInfo) {
         putGalleryInfo(downloadInfo.galleryInfo)
         db.downloadsDao().upsert(downloadInfo.downloadInfo)
     }
+
+    suspend fun importDownloadWithArtists(info: DownloadInfo) = db.importDownloadWithArtists(info)
 
     suspend fun removeDownloadInfo(downloadInfo: DownloadInfo) {
         val dao = db.downloadsDao()
@@ -89,11 +99,9 @@ object EhDB {
     suspend fun randomLocalFav() = db.localFavoritesDao().random()
 
     suspend fun removeDownloadInfo(downloadInfo: List<DownloadInfo>) {
-        val dao = db.downloadsDao()
-        downloadInfo.forEach {
-            dao.delete(it.downloadInfo)
-            deleteGalleryInfo(it.galleryInfo)
-        }
+        if (downloadInfo.isEmpty()) return
+        db.downloadsDao().delete(downloadInfo.map(DownloadInfo::downloadInfo))
+        downloadInfo.forEach { deleteGalleryInfo(it.galleryInfo) }
     }
 
     suspend fun getDownloadDirname(gid: Long): String? {
@@ -216,7 +224,7 @@ object EhDB {
     val historyLazyList
         get() = db.historyDao().joinListLazy()
 
-    fun searchHistory(keyword: String) = db.historyDao().joinListLazy("*$keyword*")
+    fun searchHistory(keyword: String) = db.historyDao().joinListLazy(gallerySearchExpression(keyword))
 
     val localFavLazyList
         get() = db.localFavoritesDao().joinListLazy()
@@ -224,7 +232,7 @@ object EhDB {
     val localFavCount: Flow<Int>
         get() = db.localFavoritesDao().count()
 
-    fun searchLocalFav(keyword: String) = db.localFavoritesDao().joinListLazy("*$keyword*")
+    fun searchLocalFav(keyword: String) = db.localFavoritesDao().joinListLazy(gallerySearchExpression(keyword))
 
     suspend fun putHistoryInfo(galleryInfo: GalleryInfo) {
         putGalleryInfo(galleryInfo.asEntity())
@@ -333,6 +341,19 @@ object EhDB {
 
         oldDB.filterDao().list().forEach {
             addFilter(it)
+        }
+    }
+}
+
+internal suspend fun EhDatabase.importDownloadWithArtists(info: DownloadInfo) {
+    useWriterConnection { writer ->
+        writer.immediateTransaction {
+            galleryDao().upsert(info.galleryInfo)
+            downloadsDao().upsert(info.downloadInfo)
+            if (info.artistInfoList.isNotEmpty()) {
+                downloadArtistDao().deleteByGid(info.gid)
+                downloadArtistDao().insertOrIgnore(info.artistInfoList)
+            }
         }
     }
 }

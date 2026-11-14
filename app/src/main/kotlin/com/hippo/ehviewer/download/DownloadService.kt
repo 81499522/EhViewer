@@ -47,12 +47,16 @@ import com.hippo.ehviewer.util.FileUtils
 import com.hippo.ehviewer.util.ReadableTime
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 class DownloadService :
     Service(),
@@ -67,6 +71,15 @@ class DownloadService :
     private val channelId by unsafeLazy { "$packageName.download" }
 
     private var serviceTimedOut = false
+    private val starts = Mutex()
+    private val startRequests = Channel<Pair<Int, Intent?>>(Channel.UNLIMITED)
+    private var startJob: Job? = null
+
+    @Volatile
+    private var latestStartId = 0
+
+    @Volatile
+    private var handledStartId = 0
 
     override fun onTimeout(startId: Int, fgsType: Int) {
         // Stop immediately: dataSync timeouts allow only a few seconds to leave the service.
@@ -92,17 +105,33 @@ class DownloadService :
                 throw it
             }
         }
-        launch {
-            deferredMgr.await().setDownloadListener(this@DownloadService)
+        startJob = launch {
+            for ((startId, intent) in startRequests) {
+                starts.withLock {
+                    deferredMgr.await().setDownloadListener(this@DownloadService)
+                    try {
+                        handleIntent(intent)
+                    } catch (failure: Exception) {
+                        if (failure is kotlinx.coroutines.CancellationException) throw failure
+                        logcat(failure)
+                    } finally {
+                        handledStartId = startId
+                        checkStopSelf(startId)
+                    }
+                }
+            }
         }
     }
 
     override fun onDestroy() {
+        startRequests.cancel()
+        val worker = startJob
+        worker?.cancel()
         val scope = this
         launch {
+            worker?.cancelAndJoin()
             val manager = deferredMgr.await()
-            manager.setDownloadListener(null)
-            if (serviceTimedOut) manager.stopAllDownload()
+            manager.detachDownloadListener(this@DownloadService, serviceTimedOut)
             // Wait for the last notification to be posted
             delay(DELAY)
             scope.cancel()
@@ -110,7 +139,8 @@ class DownloadService :
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        launch { handleIntent(intent) }
+        latestStartId = startId
+        startRequests.trySend(startId to intent)
         return START_STICKY
     }
 
@@ -131,7 +161,6 @@ class DownloadService :
             ACTION_STOP_ALL -> deferredMgr.await().stopAllDownload()
             ACTION_CLEAR -> clear()
         }
-        checkStopSelf()
     }
 
     override fun onBind(intent: Intent) = null
@@ -223,6 +252,7 @@ class DownloadService :
             builder.setContentTitle(EhUtils.getSuitableTitle(info))
                 .setContentText(null)
                 .setSubText(null)
+                .setStyle(null)
                 .setProgress(0, 0, true)
                 .setContentIntent(piActivity)
             startForeground()
@@ -230,6 +260,16 @@ class DownloadService :
     }
 
     override fun onDownload(info: DownloadInfo) {
+        if (info.archiving) {
+            downloadingNotification.run {
+                builder.setContentText(getString(R.string.download_state_archiving))
+                    .setStyle(null)
+                    .setSubText(null)
+                    .setProgress(0, 0, true)
+                startForeground()
+            }
+            return
+        }
         val speed = info.speed.coerceAtLeast(0)
         val speedText = FileUtils.humanReadableByteCount(speed) + "/s"
         val remaining = info.remaining
@@ -252,8 +292,10 @@ class DownloadService :
     override fun onFinish(info: DownloadInfo) {
         downloadingNotification.cancel()
         val finish = info.state == DownloadInfo.STATE_FINISH
+        val failureMessage = if (info.archiveFailed) R.string.stat_download_done_line_archive_failed else R.string.stat_download_done_line_failed
         val gid = info.gid
         val index = sItemStateArray.indexOfKey(gid)
+        sItemFailureMessageArray.put(gid, failureMessage)
         if (index < 0) { // Not contain
             sItemStateArray.put(gid, finish)
             sItemTitleArray.put(gid, EhUtils.getSuitableTitle(info))
@@ -297,7 +339,7 @@ class DownloadService :
             if (sFailedCount == 1) {
                 text = if (sItemTitleArray.size() >= 1) {
                     getString(
-                        R.string.stat_download_done_line_failed,
+                        sItemFailureMessageArray[sItemTitleArray.keyAt(0)] ?: R.string.stat_download_done_line_failed,
                         sItemTitleArray.valueAt(0),
                     )
                 } else {
@@ -330,7 +372,7 @@ class DownloadService :
                 }
                 style.addLine(
                     getString(
-                        if (fin) R.string.stat_download_done_line_succeeded else R.string.stat_download_done_line_failed,
+                        if (fin) R.string.stat_download_done_line_succeeded else sItemFailureMessageArray[id] ?: R.string.stat_download_done_line_failed,
                         title,
                     ),
                 )
@@ -346,19 +388,21 @@ class DownloadService :
                 .setNumber(sDownloadedCount)
             show()
         }
-        checkStopSelf()
     }
 
     override fun onCancel(info: DownloadInfo) {
         downloadingNotification.cancel()
-        checkStopSelf()
     }
 
-    private fun checkStopSelf() {
-        launch {
-            if (deferredMgr.await().isIdle) {
-                stopSelf()
-            }
+    override fun onIdle() {
+        val startId = handledStartId
+        launch { starts.withLock { checkStopSelf(startId) } }
+    }
+
+    private suspend fun checkStopSelf(startId: Int) {
+        if (startId == 0 || startId != latestStartId) return
+        deferredMgr.await().stopServiceIfIdle(this) {
+            stopSelfResult(startId)
         }
     }
 
@@ -429,6 +473,7 @@ class DownloadService :
         private const val DELAY = 1000L // 1s
         private val sItemStateArray = LongSparseArray<Boolean>()
         private val sItemTitleArray = LongSparseArray<String>()
+        private val sItemFailureMessageArray = LongSparseArray<Int>()
         private var sFailedCount = 0
         private var sFinishedCount = 0
         private var sDownloadedCount = 0
@@ -456,6 +501,7 @@ class DownloadService :
             sDownloadedCount = 0
             sItemStateArray.clear()
             sItemTitleArray.clear()
+            sItemFailureMessageArray.clear()
         }
     }
 }
